@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-مُشَجِّر (Mushajjar) — برنامج خفيف لصناعة المخططات التعليمية والتشجير العربي
+مُشَجِّر (Mushajjir) — برنامج خفيف لصناعة المخططات التعليمية والتشجير العربي
 Lightweight Arabic Educational Diagram & Tree Editor for Linux / GNOME (GTK4 + Cairo + Pango).
 
 Features:
@@ -50,7 +50,7 @@ from gi.repository import Pango, PangoCairo  # noqa: E402
 
 
 APP_NAME = "مُشَجِّر"
-APP_ID = "org.mushajjar.App"
+APP_ID = "org.mushajjir.App"
 APP_VERSION = "1.3.0"
 
 # Preferred Arabic fonts in priority order
@@ -1611,26 +1611,26 @@ def install_desktop_entry() -> None:
     apps_dir.mkdir(parents=True, exist_ok=True)
     icons_dir.mkdir(parents=True, exist_ok=True)
 
-    target_bin = bin_dir / "mushajjar"
+    target_bin = bin_dir / "mushajjir"
     if script_src != target_bin:
         shutil.copy2(script_src, target_bin)
     target_bin.chmod(0o755)
 
-    icon_path = icons_dir / "mushajjar.svg"
+    icon_path = icons_dir / "mushajjir.svg"
     icon_path.write_text(ICON_SVG, encoding="utf-8")
 
-    desktop_path = apps_dir / "mushajjar.desktop"
+    desktop_path = apps_dir / "mushajjir.desktop"
     desktop_content = (
         "[Desktop Entry]\n"
         "Type=Application\n"
         f"Name={APP_NAME}\n"
-        "Name[en]=Mushajjar\n"
+        "Name[en]=Mushajjir\n"
         "Comment=صانع المخططات التعليمية والتشجير العربي\n"
         f"Exec={target_bin} %f\n"
-        "Icon=mushajjar\n"
+        "Icon=mushajjir\n"
         "Terminal=false\n"
         "Categories=Education;Graphics;Office;\n"
-        "StartupWMClass=org.mushajjar.App\n"
+        "StartupWMClass=org.mushajjir.App\n"
     )
     desktop_path.write_text(desktop_content, encoding="utf-8")
     print(f"تم التثبيت بنجاح:\n  - البرنامج: {target_bin}\n  - الاختصار: {desktop_path}\n  - الأيقونة: {icon_path}")
@@ -1796,7 +1796,7 @@ def run_gui(initial_file: Optional[str] = None) -> int:
 
     Gtk.Widget.set_default_direction(Gtk.TextDirection.RTL)
 
-    class MushajjarWindow(Gtk.ApplicationWindow):
+    class MushajjirWindow(Gtk.ApplicationWindow):
         def __init__(self, app: Gtk.Application, open_path: Optional[str] = None) -> None:
             super().__init__(application=app, title=f"{APP_NAME} — المخططات التعليمية")
             self.set_default_size(1240, 780)
@@ -2959,7 +2959,7 @@ def run_gui(initial_file: Optional[str] = None) -> int:
                 dlg.set_filters(store)
                 dlg.open(self, None, self._on_open_done)
             else:
-                self._update_status("افتح الملف بتمريره كوسيط في الطرفية: mushajjar file.msh")
+                self._update_status("افتح الملف بتمريره كوسيط في الطرفية: mushajjir file.msh")
 
         def _on_open_done(self, dlg, res) -> None:
             try:
@@ -3037,7 +3037,7 @@ def run_gui(initial_file: Optional[str] = None) -> int:
                 win.close()
                 if hasattr(Gtk, "FileDialog"):
                     dlg = Gtk.FileDialog(title=f"تصدير ({ext.upper()})")
-                    dlg.set_initial_name(f"mushajjar{ext}")
+                    dlg.set_initial_name(f"mushajjir{ext}")
                     dlg.save(self, None, lambda d, r: self._on_export_save(d, r, ext, bg))
 
             btn_go.connect("clicked", on_go)
@@ -3058,7 +3058,7 @@ def run_gui(initial_file: Optional[str] = None) -> int:
             except Exception as exc:
                 self._update_status(f"خطأ أثناء التصدير: {exc}")
 
-    class MushajjarApp(Gtk.Application):
+    class MushajjirApp(Gtk.Application):
         def __init__(self) -> None:
             super().__init__(application_id=APP_ID)
             self._open_path = initial_file
@@ -3066,10 +3066,10 @@ def run_gui(initial_file: Optional[str] = None) -> int:
         def do_activate(self) -> None:
             win = self.props.active_window
             if not win:
-                win = MushajjarWindow(self, open_path=self._open_path)
+                win = MushajjirWindow(self, open_path=self._open_path)
             win.present()
 
-    app = MushajjarApp()
+    app = MushajjirApp()
     return app.run([])
 
 
@@ -3079,7 +3079,7 @@ def run_gui(initial_file: Optional[str] = None) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        prog="mushajjar",
+        prog="mushajjir",
         description="مُشَجِّر — برنامج خفيف لصناعة المخططات التعليمية والتشجير العربي (GTK4 + Cairo + Pango)",
     )
     parser.add_argument("file", nargs="?", help="ملف مخطط .msh لفتحه أو تصديره")

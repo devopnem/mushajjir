@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="assets/icon.svg" width="96" height="96" alt="Mushajjar Logo" />
+<img src="assets/icon.svg" width="96" height="96" alt="Mushajjir Logo" />
 
-# مُشَجِّر (Mushajjar)
+# مُشَجِّر (Mushajjir)
 
 **محرر مخططات وتشجير تعليمي عربي خفيف مبني بتقنيات GTK4 و Cairo و Pango**  
 *A lightweight Arabic educational tree and diagram editor for Linux desktops.*
@@ -25,7 +25,7 @@
 ## معاينة / Preview
 
 <div align="center">
-  <img src="assets/preview.png" alt="Mushajjar Preview Diagram" width="800" />
+  <img src="assets/preview.png" alt="Mushajjir Preview Diagram" width="800" />
 </div>
 
 ---
@@ -105,28 +105,28 @@ sudo dnf install python3 python3-gobject python3-cairo gtk4 pango
 
 ### التشغيل بالواجهة الرسومية:
 ```bash
-python3 mushajjar.py
+python3 mushajjir.py
 ```
 أو لفتح ملف مخطط محفوظ:
 ```bash
-python3 mushajjar.py diagram.msh
+python3 mushajjir.py diagram.msh
 ```
 
 ### التثبيت في قائمة برامج النظام (GNOME / FreeDesktop):
 ```bash
-python3 mushajjar.py --install-desktop
+python3 mushajjir.py --install-desktop
 ```
 
 ### التصدير عبر سطر الأوامر (CLI Export):
 ```bash
 # تصدير إلى SVG بنمط هندسي وخلفية بيضاء
-python3 mushajjar.py diagram.msh --export output.svg --style clean --bg white
+python3 mushajjir.py diagram.msh --export output.svg --style clean --bg white
 
 # تصدير إلى PNG بدقة عالية وخلفية شفافة
-python3 mushajjar.py diagram.msh --export output.png --scale 3.0 --bg transparent
+python3 mushajjir.py diagram.msh --export output.png --scale 3.0 --bg transparent
 
 # تصدير إلى PDF للطباعة
-python3 mushajjar.py diagram.msh --export output.pdf
+python3 mushajjir.py diagram.msh --export output.pdf
 ```
 
 ---
