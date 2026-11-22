@@ -51,7 +51,7 @@ from gi.repository import Pango, PangoCairo  # noqa: E402
 
 APP_NAME = "مُشَجِّر"
 APP_ID = "org.mushajjir.App"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 # Preferred Arabic fonts in priority order
 PREFERRED_ARABIC_FONTS = [
@@ -261,12 +261,50 @@ class DiagramSettings:
         )
 
 
+def get_config_path() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else (Path.home() / ".config")
+    return base / "mushajjir" / "config.json"
+
+
+def load_user_config() -> dict:
+    path = get_config_path()
+    try:
+        if path.is_file():
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_user_config(config: dict) -> bool:
+    path = get_config_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def get_default_diagram_settings(config: Optional[dict] = None) -> DiagramSettings:
+    cfg = config if config is not None else load_user_config()
+    saved = cfg.get("default_settings")
+    if isinstance(saved, dict):
+        return DiagramSettings.from_dict(saved)
+    return DiagramSettings()
+
+
 class Diagram:
-    def __init__(self) -> None:
+    def __init__(self, settings: Optional[DiagramSettings] = None) -> None:
         self.nodes: Dict[str, Node] = {}
         self.root_ids: List[str] = []
         self.links: List[CustomLink] = []
-        self.settings: DiagramSettings = DiagramSettings()
+        self.settings: DiagramSettings = settings if settings is not None else DiagramSettings()
 
     def new_id(self) -> str:
         return uuid.uuid4().hex[:8]
@@ -411,9 +449,9 @@ class Diagram:
             return cls.from_dict(json.load(f))
 
 
-def create_starter_diagram() -> Diagram:
+def create_starter_diagram(settings: Optional[DiagramSettings] = None) -> Diagram:
     """Create the classic Arabic grammar 'أقسام الاسم' diagram as the starter template."""
-    d = Diagram()
+    d = Diagram(settings=settings)
     root = d.add_node("الاسم")
     root.seed = 101
 
@@ -1801,9 +1839,12 @@ def run_gui(initial_file: Optional[str] = None) -> int:
             super().__init__(application=app, title=f"{APP_NAME} — المخططات التعليمية")
             self.set_default_size(1240, 780)
 
+            self.user_config: dict = load_user_config()
             self.layout_engine = LayoutEngine()
             self.renderer = DiagramRenderer()
-            self.diagram: Diagram = create_starter_diagram()
+            self.diagram: Diagram = create_starter_diagram(
+                settings=get_default_diagram_settings(self.user_config)
+            )
             self.current_file: Optional[str] = None
             if open_path and os.path.isfile(open_path):
                 try:
@@ -1819,7 +1860,7 @@ def run_gui(initial_file: Optional[str] = None) -> int:
             self.hover_id: Optional[str] = None
             self.connect_mode: bool = False
             self.connect_src_id: Optional[str] = None
-            self.dark_canvas: bool = True
+            self.dark_canvas: bool = bool(self.user_config.get("dark_canvas", True))
             self._updating_ui: bool = False
 
             self.zoom: float = 1.0
@@ -1917,6 +1958,7 @@ def run_gui(initial_file: Optional[str] = None) -> int:
             self.btn_canvas_theme = Gtk.ToggleButton(
                 label="معاينة ورق أبيض", tooltip_text="التبديل بين خلفية داكنة وخلفية ورقة طباعة بيضاء"
             )
+            self.btn_canvas_theme.set_active(not self.dark_canvas)
             self.btn_canvas_theme.connect("toggled", self._on_canvas_theme_toggled)
             header.pack_end(self.btn_canvas_theme)
 
@@ -2069,7 +2111,10 @@ def run_gui(initial_file: Optional[str] = None) -> int:
                 self._swatch_buttons.append(btn)
             box.append(swatch_box)
 
-            self.btn_release_free = Gtk.Button(label="إعادة هذا المربع للمحاذاة التلقائية")
+            self.btn_release_free = Gtk.Button(
+                label="إعادة هذا المربع للمحاذاة التلقائية",
+                tooltip_text="يتفعّل بعد سحب مربع شجري يدوياً (بالفأرة أو الأسهم) لإعادته إلى موضعه التلقائي في الشجرة",
+            )
             self.btn_release_free.connect("clicked", lambda *_: self._release_selected_free())
             box.append(self.btn_release_free)
 
@@ -2174,6 +2219,21 @@ def run_gui(initial_file: Optional[str] = None) -> int:
             self.spin_vgap.connect("value-changed", self._on_vgap_changed)
             vg_row.append(self.spin_vgap)
             box.append(vg_row)
+
+            btn_save_defaults = Gtk.Button(
+                label="حفظ الخيارات الحالية كافتراضية",
+                tooltip_text="حفظ جميع الخيارات الحالية كخيارات تلقائية للمخططات الجديدة",
+            )
+            btn_save_defaults.add_css_class("suggested-action")
+            btn_save_defaults.connect("clicked", lambda *_: self._save_current_as_defaults())
+            box.append(btn_save_defaults)
+
+            btn_reset_defaults = Gtk.Button(
+                label="استعادة الإعدادات الأصلية",
+                tooltip_text="إلغاء الإعدادات الافتراضية المحفوظة والعودة لإعدادات البرنامج الأصلية",
+            )
+            btn_reset_defaults.connect("clicked", lambda *_: self._reset_saved_defaults())
+            box.append(btn_reset_defaults)
 
             box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
             hint = Gtk.Label(
@@ -2595,6 +2655,7 @@ def run_gui(initial_file: Optional[str] = None) -> int:
                 node.free_pos = [node.x + dx, node.y + dy]
                 node.x += dx
                 node.y += dy
+                self._sync_inspector()
                 self.canvas.queue_draw()
                 return True
             return False
@@ -2934,9 +2995,56 @@ def run_gui(initial_file: Optional[str] = None) -> int:
             self.dark_canvas = not btn.get_active()
             self.canvas.queue_draw()
 
+        def _get_last_dir(self) -> Optional[str]:
+            last_dir = self.user_config.get("last_dir")
+            if isinstance(last_dir, str) and last_dir and os.path.isdir(last_dir):
+                return last_dir
+            if self.current_file:
+                parent = str(Path(self.current_file).parent)
+                if os.path.isdir(parent):
+                    return parent
+            return None
+
+        def _remember_dir_for_path(self, file_path: str) -> None:
+            try:
+                folder = str(Path(file_path).resolve().parent)
+                if os.path.isdir(folder):
+                    self.user_config["last_dir"] = folder
+                    save_user_config(self.user_config)
+            except Exception:
+                pass
+
+        def _apply_initial_folder(self, dlg) -> None:
+            folder = self._get_last_dir()
+            if folder and hasattr(dlg, "set_initial_folder"):
+                try:
+                    dlg.set_initial_folder(self._Gio.File.new_for_path(folder))
+                except Exception:
+                    pass
+
+        def _save_current_as_defaults(self) -> None:
+            self.user_config["default_settings"] = self.diagram.settings.to_dict()
+            self.user_config["dark_canvas"] = self.dark_canvas
+            if save_user_config(self.user_config):
+                self._update_status("تم حفظ جميع الخيارات الحالية كخيارات تلقائية للمخططات الجديدة")
+            else:
+                self._update_status("تعذّر حفظ الإعدادات الافتراضية")
+
+        def _reset_saved_defaults(self) -> None:
+            self.user_config.pop("default_settings", None)
+            self.user_config.pop("dark_canvas", None)
+            save_user_config(self.user_config)
+            self._push_undo()
+            self.diagram.settings = DiagramSettings()
+            self.dark_canvas = True
+            self.btn_canvas_theme.set_active(False)
+            self._relayout_and_redraw()
+            self._sync_inspector()
+            self._update_status("تمت استعادة الإعدادات الأصلية للبرنامج")
+
         def _new_diagram(self) -> None:
             self._push_undo()
-            self.diagram = Diagram()
+            self.diagram = Diagram(settings=get_default_diagram_settings(self.user_config))
             r = self.diagram.add_node("العنوان الرئيسي")
             self.diagram.add_node("القسم الأول", parent_id=r.id, note="مثال 1\nمثال 2")
             self.diagram.add_node("القسم الثاني", parent_id=r.id, note="مثال 3")
@@ -2951,6 +3059,7 @@ def run_gui(initial_file: Optional[str] = None) -> int:
             Gio = self._Gio
             if hasattr(Gtk, "FileDialog"):
                 dlg = Gtk.FileDialog(title="فتح مخطط مُشجِّر (.msh)")
+                self._apply_initial_folder(dlg)
                 flt = Gtk.FileFilter()
                 flt.set_name("مخططات مُشجِّر (*.msh)")
                 flt.add_pattern("*.msh")
@@ -2979,12 +3088,15 @@ def run_gui(initial_file: Optional[str] = None) -> int:
         def _save_file(self, save_as: bool = False) -> None:
             if self.current_file and not save_as:
                 self.diagram.save_json(self.current_file)
+                self._remember_dir_for_path(self.current_file)
                 self._update_status(f"تم الحفظ: {Path(self.current_file).name}")
                 return
             Gtk = self._Gtk
             if hasattr(Gtk, "FileDialog"):
                 dlg = Gtk.FileDialog(title="حفظ مخطط مُشجِّر")
-                dlg.set_initial_name("diagram.msh")
+                self._apply_initial_folder(dlg)
+                init_name = Path(self.current_file).name if self.current_file else "diagram.msh"
+                dlg.set_initial_name(init_name)
                 dlg.save(self, None, self._on_save_done)
 
         def _on_save_done(self, dlg, res) -> None:
@@ -2996,6 +3108,7 @@ def run_gui(initial_file: Optional[str] = None) -> int:
                         path += ".msh"
                     self.diagram.save_json(path)
                     self.current_file = path
+                    self._remember_dir_for_path(path)
                     self._update_status(f"تم الحفظ: {Path(path).name}")
             except Exception:
                 pass
@@ -3037,7 +3150,9 @@ def run_gui(initial_file: Optional[str] = None) -> int:
                 win.close()
                 if hasattr(Gtk, "FileDialog"):
                     dlg = Gtk.FileDialog(title=f"تصدير ({ext.upper()})")
-                    dlg.set_initial_name(f"mushajjir{ext}")
+                    self._apply_initial_folder(dlg)
+                    stem = Path(self.current_file).stem if self.current_file else "mushajjir"
+                    dlg.set_initial_name(f"{stem}{ext}")
                     dlg.save(self, None, lambda d, r: self._on_export_save(d, r, ext, bg))
 
             btn_go.connect("clicked", on_go)
@@ -3054,6 +3169,7 @@ def run_gui(initial_file: Optional[str] = None) -> int:
                     if not path.lower().endswith(ext):
                         path += ext
                     export_diagram(self.diagram, path, bg_mode=bg, scale=3.0)
+                    self._remember_dir_for_path(path)
                     self._update_status(f"تم التصدير بنجاح: {Path(path).name}")
             except Exception as exc:
                 self._update_status(f"خطأ أثناء التصدير: {exc}")
