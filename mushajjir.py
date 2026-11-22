@@ -51,7 +51,7 @@ from gi.repository import Pango, PangoCairo  # noqa: E402
 
 APP_NAME = "مُشَجِّر"
 APP_ID = "org.mushajjir.App"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.4.0"
 
 # Preferred Arabic fonts in priority order
 PREFERRED_ARABIC_FONTS = [
@@ -447,6 +447,28 @@ class Diagram:
     def load_json(cls, path: str) -> "Diagram":
         with open(path, "r", encoding="utf-8") as f:
             return cls.from_dict(json.load(f))
+
+
+@dataclass
+class DiagramTab:
+    id: str
+    diagram: Diagram
+    current_file: Optional[str] = None
+    undo_stack: List[dict] = field(default_factory=list)
+    redo_stack: List[dict] = field(default_factory=list)
+    selected_id: Optional[str] = None
+    zoom: float = 1.0
+    pan_x: float = 0.0
+    pan_y: float = 0.0
+    dirty: bool = False
+    is_starter: bool = False
+    view_initialized: bool = False
+    title_fallback: str = "مخطط جديد"
+
+    def display_name(self) -> str:
+        if self.current_file:
+            return Path(self.current_file).name
+        return self.title_fallback
 
 
 def create_starter_diagram(settings: Optional[DiagramSettings] = None) -> Diagram:
@@ -1664,7 +1686,7 @@ def install_desktop_entry() -> None:
         f"Name={APP_NAME}\n"
         "Name[en]=Mushajjir\n"
         "Comment=صانع المخططات التعليمية والتشجير العربي\n"
-        f"Exec={target_bin} %f\n"
+        f"Exec={target_bin} %F\n"
         "Icon=mushajjir\n"
         "Terminal=false\n"
         "Categories=Education;Graphics;Office;\n"
@@ -1738,6 +1760,50 @@ paned > separator:hover {
 .swatch-btn.active-swatch {
     border: 2px solid #60A5FA;
 }
+.tab-bar-strip {
+    background-color: #12161C;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 4px 8px;
+}
+.tab-item {
+    background-color: #1A2029;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 7px;
+    padding: 1px 4px;
+}
+.tab-item.active-tab {
+    background-color: #232D3B;
+    border: 1px solid rgba(96, 165, 250, 0.72);
+}
+.tab-title-btn {
+    padding: 3px 8px;
+    min-height: 24px;
+    font-size: 12.5px;
+    color: #CBD5E1;
+}
+.tab-item.active-tab .tab-title-btn {
+    color: #F8FAFC;
+    font-weight: 600;
+}
+.tab-close-btn {
+    min-width: 20px;
+    min-height: 20px;
+    padding: 0 4px;
+    border-radius: 5px;
+    font-size: 12px;
+    color: #94A3B8;
+}
+.tab-close-btn:hover {
+    background-color: rgba(248, 113, 113, 0.22);
+    color: #FCA5A5;
+}
+.tab-add-btn {
+    min-width: 28px;
+    min-height: 26px;
+    padding: 0 8px;
+    border-radius: 7px;
+    font-weight: 700;
+}
 """
         + "\n".join(swatch_rules)
     )
@@ -1790,6 +1856,8 @@ ARABIC_KEYVAL_TO_LATIN = {
     "Arabic_hamzaonwaw": "c",
     "Arabic_sukun": "x",
     "Arabic_ra": "v",
+    "Arabic_feh": "t",
+    "Arabic_sad": "w",
 }
 
 LINUX_KEYCODE_TO_LATIN = {
@@ -1803,6 +1871,8 @@ LINUX_KEYCODE_TO_LATIN = {
     38: "a",
     54: "c",
     19: "0",
+    28: "t",
+    25: "w",
 }
 
 
@@ -1818,7 +1888,7 @@ def resolve_shortcut_letter(keyval_name: str, keycode: int) -> str:
     return low
 
 
-def run_gui(initial_file: Optional[str] = None) -> int:
+def run_gui(initial_files: Optional[List[str]] = None) -> int:
     try:
         gi.require_version("Gtk", "4.0")
         gi.require_version("Gdk", "4.0")
@@ -1835,28 +1905,60 @@ def run_gui(initial_file: Optional[str] = None) -> int:
     Gtk.Widget.set_default_direction(Gtk.TextDirection.RTL)
 
     class MushajjirWindow(Gtk.ApplicationWindow):
-        def __init__(self, app: Gtk.Application, open_path: Optional[str] = None) -> None:
+        def __init__(self, app: Gtk.Application, open_paths: Optional[List[str]] = None) -> None:
             super().__init__(application=app, title=f"{APP_NAME} — المخططات التعليمية")
             self.set_default_size(1240, 780)
 
             self.user_config: dict = load_user_config()
             self.layout_engine = LayoutEngine()
             self.renderer = DiagramRenderer()
-            self.diagram: Diagram = create_starter_diagram(
-                settings=get_default_diagram_settings(self.user_config)
-            )
-            self.current_file: Optional[str] = None
-            if open_path and os.path.isfile(open_path):
-                try:
-                    self.diagram = Diagram.load_json(open_path)
-                    self.current_file = open_path
-                except Exception:
-                    pass
+            self.tabs: List[DiagramTab] = []
+            self.active_tab_idx: int = 0
+            self._tab_counter: int = 0
+            self._pending_close_tab_id: Optional[str] = None
 
-            self.undo_stack: List[dict] = []
-            self.redo_stack: List[dict] = []
+            loaded_any = False
+            for p in (open_paths or []):
+                norm = os.path.abspath(p)
+                if os.path.isfile(norm):
+                    try:
+                        diag = Diagram.load_json(norm)
+                        sel = diag.root_ids[0] if diag.root_ids else None
+                        self.tabs.append(
+                            DiagramTab(
+                                id=uuid.uuid4().hex[:8],
+                                diagram=diag,
+                                current_file=norm,
+                                selected_id=sel,
+                                is_starter=False,
+                            )
+                        )
+                        loaded_any = True
+                    except Exception:
+                        pass
 
-            self.selected_id: Optional[str] = self.diagram.root_ids[0] if self.diagram.root_ids else None
+            if not loaded_any:
+                starter = create_starter_diagram(
+                    settings=get_default_diagram_settings(self.user_config)
+                )
+                self._tab_counter += 1
+                self.tabs.append(
+                    DiagramTab(
+                        id=uuid.uuid4().hex[:8],
+                        diagram=starter,
+                        current_file=None,
+                        selected_id=starter.root_ids[0] if starter.root_ids else None,
+                        is_starter=True,
+                        title_fallback=f"مخطط {self._tab_counter}",
+                    )
+                )
+
+            self.diagram: Diagram = self.tabs[0].diagram
+            self.current_file: Optional[str] = self.tabs[0].current_file
+            self.undo_stack: List[dict] = self.tabs[0].undo_stack
+            self.redo_stack: List[dict] = self.tabs[0].redo_stack
+            self.selected_id: Optional[str] = self.tabs[0].selected_id
+
             self.hover_id: Optional[str] = None
             self.connect_mode: bool = False
             self.connect_src_id: Optional[str] = None
@@ -1877,8 +1979,10 @@ def run_gui(initial_file: Optional[str] = None) -> int:
 
             self.layout_engine.layout(self.diagram)
             self._build_ui(Gtk, Gdk, Gio, GLib)
+            self._refresh_tab_bar()
+            self._update_window_title()
             self._sync_inspector()
-            GLib.idle_add(self.fit_to_view)
+            GLib.idle_add(self._fit_initial_view)
 
         def _build_ui(self, Gtk, Gdk, Gio, GLib) -> None:
             self._Gtk = Gtk
@@ -1968,6 +2072,23 @@ def run_gui(initial_file: Optional[str] = None) -> int:
 
             root_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             self.set_child(root_vbox)
+
+            tab_bar_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            tab_bar_row.add_css_class("tab-bar-strip")
+            tab_scroll = Gtk.ScrolledWindow()
+            tab_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+            tab_scroll.set_hexpand(True)
+            tab_scroll.set_propagate_natural_height(True)
+            self.tab_strip_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            tab_scroll.set_child(self.tab_strip_box)
+            tab_bar_row.append(tab_scroll)
+
+            btn_new_tab = Gtk.Button(label="+", tooltip_text="لسان جديد لمخطط آخر (Ctrl+T / Ctrl+N)")
+            btn_new_tab.add_css_class("flat")
+            btn_new_tab.add_css_class("tab-add-btn")
+            btn_new_tab.connect("clicked", lambda *_: self._new_diagram())
+            tab_bar_row.append(btn_new_tab)
+            root_vbox.append(tab_bar_row)
 
             self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
             self.paned.set_vexpand(True)
@@ -2243,6 +2364,9 @@ def run_gui(initial_file: Optional[str] = None) -> int:
                 "• Shift+Enter: إضافة نظير\n"
                 "• Enter داخل النص: سطر جديد\n"
                 "• Ctrl+Enter في النافذة المنبثقة: حفظ\n"
+                "• Ctrl+T / Ctrl+N: لسان جديد\n"
+                "• Ctrl+W: إغلاق اللسان الحالي\n"
+                "• Ctrl+Tab: التنقل بين الألسنة\n"
                 "• F9: إظهار/إخفاء لوحة الخيارات\n"
                 "• Ctrl+L: إعادة ترتيب الشجرة",
                 xalign=0.0,
@@ -2393,6 +2517,7 @@ def run_gui(initial_file: Optional[str] = None) -> int:
             if len(self.undo_stack) > 60:
                 self.undo_stack.pop(0)
             self.redo_stack.clear()
+            self._mark_dirty()
 
         def undo(self) -> None:
             if not self.undo_stack:
@@ -2593,8 +2718,17 @@ def run_gui(initial_file: Optional[str] = None) -> int:
             if ctrl_down and letter == "o":
                 self._open_file_dialog()
                 return True
-            if ctrl_down and letter == "n":
+            if ctrl_down and letter in ("n", "t"):
                 self._new_diagram()
+                return True
+            if ctrl_down and letter == "w":
+                self._request_close_tab(self.active_tab_idx)
+                return True
+            if ctrl_down and (name == "Page_Down" or (name == "Tab" and not shift_down)):
+                self._switch_tab_relative(1)
+                return True
+            if ctrl_down and (name in ("Page_Up", "ISO_Left_Tab") or (name == "Tab" and shift_down)):
+                self._switch_tab_relative(-1)
                 return True
             if ctrl_down and letter == "e":
                 self._show_export_dialog()
@@ -2857,12 +2991,14 @@ def run_gui(initial_file: Optional[str] = None) -> int:
             if self._updating_ui or not self.selected_id or self.selected_id not in self.diagram.nodes:
                 return
             self.diagram.nodes[self.selected_id].title = get_textview_text(self.tv_title)
+            self._mark_dirty()
             self._relayout_and_redraw()
 
         def _on_note_changed(self, _buf) -> None:
             if self._updating_ui or not self.selected_id or self.selected_id not in self.diagram.nodes:
                 return
             self.diagram.nodes[self.selected_id].note = get_textview_text(self.tv_note)
+            self._mark_dirty()
             self._relayout_and_redraw()
 
         def _on_brace_toggled(self, sw, _pspec) -> None:
@@ -3042,17 +3178,273 @@ def run_gui(initial_file: Optional[str] = None) -> int:
             self._sync_inspector()
             self._update_status("تمت استعادة الإعدادات الأصلية للبرنامج")
 
-        def _new_diagram(self) -> None:
-            self._push_undo()
-            self.diagram = Diagram(settings=get_default_diagram_settings(self.user_config))
-            r = self.diagram.add_node("العنوان الرئيسي")
-            self.diagram.add_node("القسم الأول", parent_id=r.id, note="مثال 1\nمثال 2")
-            self.diagram.add_node("القسم الثاني", parent_id=r.id, note="مثال 3")
-            self.current_file = None
-            self.selected_id = r.id
-            self._relayout_and_redraw()
-            self._sync_inspector()
+        def _current_tab(self) -> DiagramTab:
+            return self.tabs[self.active_tab_idx]
+
+        def _fit_initial_view(self) -> bool:
             self.fit_to_view()
+            if self.tabs:
+                self._current_tab().view_initialized = True
+                self._save_active_tab_state()
+            return False
+
+        def _save_active_tab_state(self) -> None:
+            if not self.tabs or not (0 <= self.active_tab_idx < len(self.tabs)):
+                return
+            tab = self.tabs[self.active_tab_idx]
+            tab.diagram = self.diagram
+            tab.current_file = self.current_file
+            tab.undo_stack = self.undo_stack
+            tab.redo_stack = self.redo_stack
+            tab.selected_id = self.selected_id
+            tab.zoom = self.zoom
+            tab.pan_x = self.pan_x
+            tab.pan_y = self.pan_y
+
+        def _load_active_tab_state(self) -> None:
+            tab = self.tabs[self.active_tab_idx]
+            self.diagram = tab.diagram
+            self.current_file = tab.current_file
+            self.undo_stack = tab.undo_stack
+            self.redo_stack = tab.redo_stack
+            self.selected_id = tab.selected_id
+            self.zoom = tab.zoom
+            self.pan_x = tab.pan_x
+            self.pan_y = tab.pan_y
+
+        def _mark_dirty(self) -> None:
+            if not self.tabs:
+                return
+            tab = self._current_tab()
+            changed = (not tab.dirty) or tab.is_starter
+            tab.dirty = True
+            tab.is_starter = False
+            if changed:
+                self._refresh_tab_bar()
+                self._update_window_title()
+
+        def _update_window_title(self) -> None:
+            if not self.tabs:
+                self.set_title(f"{APP_NAME} — المخططات التعليمية")
+                return
+            tab = self._current_tab()
+            mark = "• " if tab.dirty else ""
+            self.set_title(f"{mark}{tab.display_name()} — {APP_NAME}")
+
+        def _refresh_tab_bar(self) -> None:
+            Gtk = self._Gtk
+            child = self.tab_strip_box.get_first_child()
+            while child is not None:
+                nxt = child.get_next_sibling()
+                self.tab_strip_box.remove(child)
+                child = nxt
+
+            for idx, tab in enumerate(self.tabs):
+                item = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+                item.add_css_class("tab-item")
+                if idx == self.active_tab_idx:
+                    item.add_css_class("active-tab")
+
+                mark = "• " if tab.dirty else ""
+                btn_title = Gtk.Button(label=f"{mark}{tab.display_name()}")
+                btn_title.add_css_class("flat")
+                btn_title.add_css_class("tab-title-btn")
+                if tab.current_file:
+                    btn_title.set_tooltip_text(tab.current_file)
+                btn_title.connect("clicked", lambda _b, i=idx: self._switch_to_tab(i))
+                item.append(btn_title)
+
+                btn_close = Gtk.Button(label="×", tooltip_text="إغلاق اللسان (Ctrl+W)")
+                btn_close.add_css_class("flat")
+                btn_close.add_css_class("tab-close-btn")
+                btn_close.connect("clicked", lambda _b, i=idx: self._request_close_tab(i))
+                item.append(btn_close)
+
+                self.tab_strip_box.append(item)
+
+        def _switch_to_tab(self, idx: int) -> None:
+            if not (0 <= idx < len(self.tabs)):
+                return
+            if idx != self.active_tab_idx:
+                self._save_active_tab_state()
+                self.active_tab_idx = idx
+            self._load_active_tab_state()
+            self.connect_src_id = None
+            if hasattr(self, "btn_connect") and self.btn_connect.get_active():
+                self.btn_connect.set_active(False)
+            self.layout_engine.layout(self.diagram)
+            self._sync_inspector()
+            self._refresh_tab_bar()
+            self._update_window_title()
+            tab = self._current_tab()
+            if not tab.view_initialized:
+                self.fit_to_view()
+                tab.view_initialized = True
+                self._save_active_tab_state()
+            else:
+                self.zoom_label.set_text(f"{int(self.zoom * 100)}%")
+                self.canvas.queue_draw()
+
+        def _switch_tab_relative(self, delta: int) -> None:
+            if len(self.tabs) <= 1:
+                return
+            nxt = (self.active_tab_idx + delta) % len(self.tabs)
+            self._switch_to_tab(nxt)
+
+        def _make_blank_tab(self) -> DiagramTab:
+            diag = Diagram(settings=get_default_diagram_settings(self.user_config))
+            r = diag.add_node("العنوان الرئيسي")
+            diag.add_node("القسم الأول", parent_id=r.id, note="مثال 1\nمثال 2")
+            diag.add_node("القسم الثاني", parent_id=r.id, note="مثال 3")
+            self._tab_counter += 1
+            return DiagramTab(
+                id=uuid.uuid4().hex[:8],
+                diagram=diag,
+                current_file=None,
+                selected_id=r.id,
+                dirty=False,
+                is_starter=False,
+                view_initialized=False,
+                title_fallback=f"مخطط {self._tab_counter}",
+            )
+
+        def open_file_in_tab(self, path: str) -> None:
+            norm = os.path.abspath(path)
+            if not os.path.isfile(norm):
+                self._update_status(f"الملف غير موجود: {path}")
+                return
+
+            self._save_active_tab_state()
+            for idx, tab in enumerate(self.tabs):
+                if tab.current_file and os.path.abspath(tab.current_file) == norm:
+                    self._switch_to_tab(idx)
+                    self._update_status(f"الملف مفتوح مسبقاً: {Path(norm).name}")
+                    return
+
+            try:
+                diag = Diagram.load_json(norm)
+            except Exception as exc:
+                self._update_status(f"تعذّر فتح الملف: {exc}")
+                return
+
+            new_tab = DiagramTab(
+                id=uuid.uuid4().hex[:8],
+                diagram=diag,
+                current_file=norm,
+                selected_id=diag.root_ids[0] if diag.root_ids else None,
+                dirty=False,
+                is_starter=False,
+                view_initialized=False,
+            )
+
+            if (
+                len(self.tabs) == 1
+                and self.tabs[0].is_starter
+                and not self.tabs[0].dirty
+                and self.tabs[0].current_file is None
+            ):
+                self.tabs[0] = new_tab
+                self.active_tab_idx = 0
+                self._switch_to_tab(0)
+            else:
+                self.tabs.append(new_tab)
+                self._switch_to_tab(len(self.tabs) - 1)
+            self._update_status(f"تم فتح: {Path(norm).name}")
+
+        def _request_close_tab(self, idx: int) -> None:
+            if not (0 <= idx < len(self.tabs)):
+                return
+            self._save_active_tab_state()
+            tab = self.tabs[idx]
+            if not tab.dirty:
+                self._close_tab_now(idx)
+                return
+
+            Gtk = self._Gtk
+            win = Gtk.Window(transient_for=self, modal=True, title="تغييرات غير محفوظة")
+            win.set_default_size(360, 140)
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            vbox.set_margin_top(16)
+            vbox.set_margin_bottom(14)
+            vbox.set_margin_start(16)
+            vbox.set_margin_end(16)
+            win.set_child(vbox)
+
+            lbl = Gtk.Label(
+                label=f"يوجد تعديلات غير محفوظة في «{tab.display_name()}». هل تريد حفظها قبل الإغلاق؟",
+                xalign=0.0,
+            )
+            lbl.set_wrap(True)
+            vbox.append(lbl)
+
+            btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            btn_cancel = Gtk.Button(label="إلغاء", hexpand=True)
+            btn_cancel.connect("clicked", lambda *_: win.close())
+
+            btn_discard = Gtk.Button(label="إغلاق بدون حفظ", hexpand=True)
+            btn_discard.add_css_class("destructive-action")
+
+            def on_discard(*_):
+                win.close()
+                for i, t in enumerate(self.tabs):
+                    if t.id == tab.id:
+                        self._close_tab_now(i)
+                        break
+
+            btn_discard.connect("clicked", on_discard)
+
+            btn_save_close = Gtk.Button(label="حفظ وإغلاق", hexpand=True)
+            btn_save_close.add_css_class("suggested-action")
+
+            def on_save_close(*_):
+                win.close()
+                for i, t in enumerate(self.tabs):
+                    if t.id == tab.id:
+                        self._switch_to_tab(i)
+                        self._pending_close_tab_id = tab.id
+                        self._save_file(save_as=False)
+                        break
+
+            btn_save_close.connect("clicked", on_save_close)
+            btn_row.append(btn_cancel)
+            btn_row.append(btn_discard)
+            btn_row.append(btn_save_close)
+            vbox.append(btn_row)
+            win.present()
+
+        def _close_tab_now(self, idx: int) -> None:
+            if not (0 <= idx < len(self.tabs)):
+                return
+            if len(self.tabs) == 1:
+                self.tabs[0] = self._make_blank_tab()
+                self.active_tab_idx = 0
+                self._switch_to_tab(0)
+                self._update_status("تم فتح مخطط جديد")
+                return
+
+            self._save_active_tab_state()
+            self.tabs.pop(idx)
+            if idx < self.active_tab_idx:
+                self.active_tab_idx -= 1
+            elif idx == self.active_tab_idx:
+                self.active_tab_idx = min(idx, len(self.tabs) - 1)
+            self._switch_to_tab(self.active_tab_idx)
+
+        def _complete_pending_close(self, tab_id: str) -> None:
+            if self._pending_close_tab_id != tab_id:
+                return
+            self._pending_close_tab_id = None
+            for i, t in enumerate(self.tabs):
+                if t.id == tab_id:
+                    self._close_tab_now(i)
+                    break
+
+        def _new_diagram(self) -> None:
+            self._save_active_tab_state()
+            new_tab = self._make_blank_tab()
+            self.tabs.append(new_tab)
+            self._switch_to_tab(len(self.tabs) - 1)
+            self._update_status(f"تم فتح لسان جديد: {new_tab.display_name()}")
 
         def _open_file_dialog(self) -> None:
             Gtk = self._Gtk
@@ -3074,44 +3466,58 @@ def run_gui(initial_file: Optional[str] = None) -> int:
             try:
                 gfile = dlg.open_finish(res)
                 if gfile and gfile.get_path():
-                    self._push_undo()
-                    self.diagram = Diagram.load_json(gfile.get_path())
-                    self.current_file = gfile.get_path()
-                    self.selected_id = self.diagram.root_ids[0] if self.diagram.root_ids else None
-                    self._relayout_and_redraw()
-                    self._sync_inspector()
-                    self.fit_to_view()
-                    self._update_status(f"تم فتح: {Path(self.current_file).name}")
+                    self.open_file_in_tab(gfile.get_path())
             except Exception:
                 pass
 
         def _save_file(self, save_as: bool = False) -> None:
+            tab = self._current_tab()
             if self.current_file and not save_as:
                 self.diagram.save_json(self.current_file)
+                tab.current_file = self.current_file
+                tab.dirty = False
+                tab.is_starter = False
                 self._remember_dir_for_path(self.current_file)
+                self._refresh_tab_bar()
+                self._update_window_title()
                 self._update_status(f"تم الحفظ: {Path(self.current_file).name}")
+                self._complete_pending_close(tab.id)
                 return
             Gtk = self._Gtk
             if hasattr(Gtk, "FileDialog"):
                 dlg = Gtk.FileDialog(title="حفظ مخطط مُشجِّر")
                 self._apply_initial_folder(dlg)
-                init_name = Path(self.current_file).name if self.current_file else "diagram.msh"
+                init_name = Path(self.current_file).name if self.current_file else f"{tab.display_name()}.msh"
                 dlg.set_initial_name(init_name)
-                dlg.save(self, None, self._on_save_done)
+                dlg.save(self, None, lambda d, r, tid=tab.id: self._on_save_done(d, r, tid))
 
-        def _on_save_done(self, dlg, res) -> None:
+        def _on_save_done(self, dlg, res, tab_id: str) -> None:
             try:
                 gfile = dlg.save_finish(res)
                 if gfile and gfile.get_path():
-                    path = gfile.get_path()
+                    path = os.path.abspath(gfile.get_path())
                     if not path.endswith(".msh"):
                         path += ".msh"
-                    self.diagram.save_json(path)
-                    self.current_file = path
+                    target_tab = next((t for t in self.tabs if t.id == tab_id), None)
+                    if target_tab is None:
+                        return
+                    if self._current_tab().id == tab_id:
+                        self.diagram.save_json(path)
+                        self.current_file = path
+                    else:
+                        target_tab.diagram.save_json(path)
+                    target_tab.current_file = path
+                    target_tab.dirty = False
+                    target_tab.is_starter = False
                     self._remember_dir_for_path(path)
+                    self._refresh_tab_bar()
+                    self._update_window_title()
                     self._update_status(f"تم الحفظ: {Path(path).name}")
+                    self._complete_pending_close(tab_id)
+                else:
+                    self._pending_close_tab_id = None
             except Exception:
-                pass
+                self._pending_close_tab_id = None
 
         def _show_export_dialog(self) -> None:
             Gtk = self._Gtk
@@ -3176,17 +3582,30 @@ def run_gui(initial_file: Optional[str] = None) -> int:
 
     class MushajjirApp(Gtk.Application):
         def __init__(self) -> None:
-            super().__init__(application_id=APP_ID)
-            self._open_path = initial_file
+            super().__init__(
+                application_id=APP_ID,
+                flags=Gio.ApplicationFlags.HANDLES_OPEN,
+            )
 
         def do_activate(self) -> None:
             win = self.props.active_window
             if not win:
-                win = MushajjirWindow(self, open_path=self._open_path)
+                win = MushajjirWindow(self)
+            win.present()
+
+        def do_open(self, files, n_files: int, hint: str) -> None:
+            paths = [gf.get_path() for gf in files if gf and gf.get_path()]
+            win = self.props.active_window
+            if not win:
+                win = MushajjirWindow(self, open_paths=paths)
+            else:
+                for p in paths:
+                    win.open_file_in_tab(p)
             win.present()
 
     app = MushajjirApp()
-    return app.run([])
+    argv = [sys.argv[0]] + [os.path.abspath(p) for p in (initial_files or [])]
+    return app.run(argv)
 
 
 # =============================================================================
@@ -3198,7 +3617,7 @@ def main() -> int:
         prog="mushajjir",
         description="مُشَجِّر — برنامج خفيف لصناعة المخططات التعليمية والتشجير العربي (GTK4 + Cairo + Pango)",
     )
-    parser.add_argument("file", nargs="?", help="ملف مخطط .msh لفتحه أو تصديره")
+    parser.add_argument("files", nargs="*", help="ملف أو ملفات مخطط .msh لفتحها أو تصديرها")
     parser.add_argument("--export", metavar="OUT", help="تصدير مباشر بدون واجهة إلى .svg أو .pdf أو .png")
     parser.add_argument("--bg", choices=["white", "transparent", "dark"], default="white", help="خلفية التصدير")
     parser.add_argument("--style", choices=["sketchy", "clean"], help="تجاوز نمط الرسم عند التصدير")
@@ -3212,7 +3631,8 @@ def main() -> int:
         return 0
 
     if args.export:
-        diag = Diagram.load_json(args.file) if args.file else create_starter_diagram()
+        first_file = args.files[0] if args.files else None
+        diag = Diagram.load_json(first_file) if first_file else create_starter_diagram()
         if args.style:
             diag.settings.style = args.style
         if args.dir:
@@ -3221,7 +3641,7 @@ def main() -> int:
         print(f"Exported: {args.export}")
         return 0
 
-    return run_gui(initial_file=args.file)
+    return run_gui(initial_files=args.files)
 
 
 if __name__ == "__main__":
