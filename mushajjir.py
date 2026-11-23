@@ -51,7 +51,7 @@ from gi.repository import Pango, PangoCairo  # noqa: E402
 
 APP_NAME = "مُشَجِّر"
 APP_ID = "org.mushajjir.App"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 
 # Preferred Arabic fonts in priority order
 PREFERRED_ARABIC_FONTS = [
@@ -1662,14 +1662,31 @@ ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
 """
 
 
+MIME_TYPE = "application/x-mushajjir"
+MIME_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-mushajjir">
+    <comment>Mushajjir Diagram</comment>
+    <comment xml:lang="ar">مخطط مُشَجِّر</comment>
+    <sub-class-of type="application/json"/>
+    <glob pattern="*.msh" weight="60"/>
+    <icon name="mushajjir"/>
+  </mime-type>
+</mime-info>
+"""
+
+
 def install_desktop_entry() -> None:
     script_src = Path(__file__).resolve()
     bin_dir = Path.home() / ".local" / "bin"
     apps_dir = Path.home() / ".local" / "share" / "applications"
     icons_dir = Path.home() / ".local" / "share" / "icons" / "hicolor" / "scalable" / "apps"
+    mime_dir = Path.home() / ".local" / "share" / "mime"
+    mime_pkg_dir = mime_dir / "packages"
     bin_dir.mkdir(parents=True, exist_ok=True)
     apps_dir.mkdir(parents=True, exist_ok=True)
     icons_dir.mkdir(parents=True, exist_ok=True)
+    mime_pkg_dir.mkdir(parents=True, exist_ok=True)
 
     target_bin = bin_dir / "mushajjir"
     if script_src != target_bin:
@@ -1678,6 +1695,9 @@ def install_desktop_entry() -> None:
 
     icon_path = icons_dir / "mushajjir.svg"
     icon_path.write_text(ICON_SVG, encoding="utf-8")
+
+    mime_path = mime_pkg_dir / "mushajjir.xml"
+    mime_path.write_text(MIME_XML, encoding="utf-8")
 
     desktop_path = apps_dir / "mushajjir.desktop"
     desktop_content = (
@@ -1690,10 +1710,28 @@ def install_desktop_entry() -> None:
         "Icon=mushajjir\n"
         "Terminal=false\n"
         "Categories=Education;Graphics;Office;\n"
+        f"MimeType={MIME_TYPE};\n"
         "StartupWMClass=org.mushajjir.App\n"
     )
     desktop_path.write_text(desktop_content, encoding="utf-8")
-    print(f"تم التثبيت بنجاح:\n  - البرنامج: {target_bin}\n  - الاختصار: {desktop_path}\n  - الأيقونة: {icon_path}")
+
+    for cmd in (
+        ["update-mime-database", str(mime_dir)],
+        ["update-desktop-database", str(apps_dir)],
+        ["xdg-mime", "default", "mushajjir.desktop", MIME_TYPE],
+    ):
+        try:
+            subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            pass
+
+    print(
+        f"تم التثبيت بنجاح:\n"
+        f"  - البرنامج: {target_bin}\n"
+        f"  - الاختصار: {desktop_path}\n"
+        f"  - الأيقونة: {icon_path}\n"
+        f"  - نوع الملف (.msh): {mime_path}"
+    )
 
 
 # =============================================================================
@@ -2364,6 +2402,7 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
                 "• Shift+Enter: إضافة نظير\n"
                 "• Enter داخل النص: سطر جديد\n"
                 "• Ctrl+Enter في النافذة المنبثقة: حفظ\n"
+                "• Ctrl+E: فتح نافذة التصدير (Enter للحفظ)\n"
                 "• Ctrl+T / Ctrl+N: لسان جديد\n"
                 "• Ctrl+W: إغلاق اللسان الحالي\n"
                 "• Ctrl+Tab: التنقل بين الألسنة\n"
@@ -3521,6 +3560,8 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
 
         def _show_export_dialog(self) -> None:
             Gtk = self._Gtk
+            Gdk = self._Gdk
+            GLib = self._GLib
             win = Gtk.Window(transient_for=self, modal=True, title="تصدير المخطط")
             win.set_default_size(360, 210)
             vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -3543,12 +3584,18 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
             vbox.append(bg_row)
 
             btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-            btn_cancel = Gtk.Button(label="إلغاء", hexpand=True)
+            btn_cancel = Gtk.Button(label="إلغاء (Esc)", hexpand=True)
             btn_cancel.connect("clicked", lambda *_: win.close())
-            btn_go = Gtk.Button(label="اختيار مكان الحفظ...", hexpand=True)
+            btn_go = Gtk.Button(label="اختيار مكان الحفظ... (Enter)", hexpand=True)
             btn_go.add_css_class("suggested-action")
 
+            triggered = False
+
             def on_go(*_):
+                nonlocal triggered
+                if triggered:
+                    return
+                triggered = True
                 exts = [".svg", ".pdf", ".png"]
                 bgs = ["white", "transparent", "dark"]
                 ext = exts[dd_fmt.get_selected()]
@@ -3561,11 +3608,51 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
                     dlg.set_initial_name(f"{stem}{ext}")
                     dlg.save(self, None, lambda d, r: self._on_export_save(d, r, ext, bg))
 
+            def is_dropdown_open(dd) -> bool:
+                child = dd.get_first_child()
+                while child is not None:
+                    if isinstance(child, Gtk.ToggleButton) and child.get_active():
+                        return True
+                    if isinstance(child, Gtk.Popover) and child.get_visible():
+                        return True
+                    child = child.get_next_sibling()
+                return False
+
+            def focus_save_btn(*_):
+                if win.get_visible():
+                    btn_go.grab_focus()
+                return False
+
+            dd_fmt.connect("notify::selected", lambda *_: GLib.idle_add(focus_save_btn))
+            dd_bg.connect("notify::selected", lambda *_: GLib.idle_add(focus_save_btn))
+
+            key_ctrl = Gtk.EventControllerKey()
+            key_ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+
+            def on_dialog_key(_c, keyval, _code, _state):
+                name = Gdk.keyval_name(keyval) or ""
+                if is_dropdown_open(dd_fmt) or is_dropdown_open(dd_bg):
+                    return False
+                if name == "Escape":
+                    win.close()
+                    return True
+                if name in ("Return", "KP_Enter"):
+                    if win.get_focus() is btn_cancel:
+                        return False
+                    on_go()
+                    return True
+                return False
+
+            key_ctrl.connect("key-pressed", on_dialog_key)
+            win.add_controller(key_ctrl)
+
             btn_go.connect("clicked", on_go)
             btn_row.append(btn_cancel)
             btn_row.append(btn_go)
             vbox.append(btn_row)
+            win.set_default_widget(btn_go)
             win.present()
+            GLib.idle_add(focus_save_btn)
 
         def _on_export_save(self, dlg, res, ext: str, bg: str) -> None:
             try:
