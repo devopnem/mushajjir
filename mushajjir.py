@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import io
 import json
 import math
 import os
@@ -51,7 +52,7 @@ from gi.repository import Pango, PangoCairo  # noqa: E402
 
 APP_NAME = "مُشَجِّر"
 APP_ID = "org.mushajjir.App"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.5.0"
 
 # Preferred Arabic fonts in priority order
 PREFERRED_ARABIC_FONTS = [
@@ -404,6 +405,19 @@ class Diagram:
         self.links.append(lk)
         return lk
 
+    def get_link(self, link_id: Optional[str]) -> Optional[CustomLink]:
+        if not link_id:
+            return None
+        for lk in self.links:
+            if lk.id == link_id:
+                return lk
+        return None
+
+    def delete_link(self, link_id: str) -> bool:
+        before = len(self.links)
+        self.links = [lk for lk in self.links if lk.id != link_id]
+        return len(self.links) < before
+
     def clear_links_for_node(self, nid: str) -> int:
         before = len(self.links)
         self.links = [lk for lk in self.links if lk.src_id != nid and lk.dst_id != nid]
@@ -411,6 +425,145 @@ class Diagram:
 
     def has_links_for_node(self, nid: str) -> bool:
         return any(lk.src_id == nid or lk.dst_id == nid for lk in self.links)
+
+    def collect_subtree_ids(self, nid: str) -> List[str]:
+        if nid not in self.nodes:
+            return []
+        result: List[str] = []
+        visited = set()
+
+        def dfs(curr: str) -> None:
+            if curr in visited or curr not in self.nodes:
+                return
+            visited.add(curr)
+            result.append(curr)
+            for cid in self.nodes[curr].children:
+                dfs(cid)
+
+        dfs(nid)
+        return result
+
+    def serialize_subtree(self, nid: str) -> Optional[dict]:
+        ids = self.collect_subtree_ids(nid)
+        if not ids:
+            return None
+        id_set = set(ids)
+        nodes_data = [self.nodes[i].to_dict() for i in ids]
+        links_data = [
+            lk.to_dict()
+            for lk in self.links
+            if lk.src_id in id_set and lk.dst_id in id_set
+        ]
+        return {
+            "root_id": nid,
+            "nodes": nodes_data,
+            "links": links_data,
+        }
+
+    def paste_subtree(
+        self,
+        payload: dict,
+        target_parent_id: Optional[str] = None,
+        free_offset: Tuple[float, float] = (32.0, 32.0),
+    ) -> Optional[Node]:
+        raw_nodes = payload.get("nodes") or []
+        orig_root_id = payload.get("root_id")
+        if not raw_nodes or not orig_root_id:
+            return None
+
+        id_map: Dict[str, str] = {nd["id"]: self.new_id() for nd in raw_nodes}
+        if orig_root_id not in id_map:
+            return None
+
+        new_nodes: Dict[str, Node] = {}
+        for nd in raw_nodes:
+            cloned = Node.from_dict(nd)
+            old_id = cloned.id
+            cloned.id = id_map[old_id]
+            cloned.seed = random.randint(1, 999999)
+            cloned.children = [id_map[c] for c in cloned.children if c in id_map]
+            if old_id == orig_root_id:
+                cloned.parent_id = None
+            else:
+                cloned.parent_id = id_map.get(cloned.parent_id)
+                if not cloned.is_free:
+                    cloned.free_pos = None
+            new_nodes[cloned.id] = cloned
+
+        root_node = new_nodes[id_map[orig_root_id]]
+        if root_node.is_free:
+            root_node.parent_id = None
+            if root_node.free_pos is not None:
+                root_node.free_pos = [
+                    float(root_node.free_pos[0]) + free_offset[0],
+                    float(root_node.free_pos[1]) + free_offset[1],
+                ]
+        else:
+            root_node.free_pos = None
+            if target_parent_id and target_parent_id in self.nodes and not self.nodes[target_parent_id].is_free:
+                parent = self.nodes[target_parent_id]
+                root_node.parent_id = parent.id
+                parent.children.append(root_node.id)
+                if parent.parent_id is not None:
+                    # Inherit parent's branch_side across pasted subtree
+                    target_side = parent.branch_side
+                    for n in new_nodes.values():
+                        n.branch_side = target_side
+            else:
+                root_node.parent_id = None
+                self.root_ids.append(root_node.id)
+
+        for nid, node in new_nodes.items():
+            self.nodes[nid] = node
+
+        for ld in payload.get("links") or []:
+            src = id_map.get(ld.get("src_id", ""))
+            dst = id_map.get(ld.get("dst_id", ""))
+            if src and dst and src != dst:
+                lk = CustomLink(
+                    id=self.new_id(),
+                    src_id=src,
+                    dst_id=dst,
+                    label=ld.get("label", ""),
+                    dashed=bool(ld.get("dashed", False)),
+                    arrow=bool(ld.get("arrow", True)),
+                )
+                self.links.append(lk)
+
+        return root_node
+
+    def reparent_node(self, nid: str, new_parent_id: Optional[str]) -> bool:
+        if nid not in self.nodes:
+            return False
+        if new_parent_id == nid:
+            return False
+        if new_parent_id is not None:
+            if new_parent_id not in self.nodes:
+                return False
+            if new_parent_id in self.collect_subtree_ids(nid):
+                return False
+
+        node = self.nodes[nid]
+        if node.parent_id and node.parent_id in self.nodes:
+            old_parent = self.nodes[node.parent_id]
+            if nid in old_parent.children:
+                old_parent.children.remove(nid)
+        if nid in self.root_ids:
+            self.root_ids.remove(nid)
+
+        node.is_free = False
+        node.parent_id = new_parent_id
+
+        if new_parent_id is not None:
+            new_parent = self.nodes[new_parent_id]
+            if nid not in new_parent.children:
+                new_parent.children.append(nid)
+            side = new_parent.branch_side if new_parent.parent_id is not None else "down"
+            self.set_subtree_side(nid, side)
+        else:
+            self.root_ids.append(nid)
+            self.set_subtree_side(nid, "down")
+        return True
 
     def reset_all_free_positions(self) -> None:
         """Snap all tree nodes back to automatic tidy layout (keeps independent free boxes)."""
@@ -457,6 +610,7 @@ class DiagramTab:
     undo_stack: List[dict] = field(default_factory=list)
     redo_stack: List[dict] = field(default_factory=list)
     selected_id: Optional[str] = None
+    selected_link_id: Optional[str] = None
     zoom: float = 1.0
     pan_x: float = 0.0
     pan_y: float = 0.0
@@ -505,16 +659,83 @@ def create_starter_diagram(settings: Optional[DiagramSettings] = None) -> Diagra
     return d
 
 
+def parse_outline_text(text: str, settings: Optional[DiagramSettings] = None) -> Diagram:
+    """Parse an indented Arabic/Unicode outline (e.g. 'العنوان | الأمثلة') into a Diagram."""
+    diag = Diagram(settings=settings)
+    stack: List[Tuple[int, str]] = []
+    bullet_prefixes = ("- ", "* ", "• ", "– ", "— ", "+ ")
+
+    for raw_line in text.splitlines():
+        if not raw_line.strip():
+            continue
+        expanded = raw_line.expandtabs(4)
+        stripped = expanded.lstrip(" ")
+        indent = len(expanded) - len(stripped)
+
+        for bp in bullet_prefixes:
+            if stripped.startswith(bp):
+                stripped = stripped[len(bp):].lstrip(" ")
+                break
+        if not stripped:
+            continue
+
+        if "|" in stripped:
+            left, right = stripped.split("|", 1)
+            title = left.strip()
+            note = right.strip().replace("\\n", "\n")
+        else:
+            title = stripped.strip()
+            note = ""
+
+        if not title:
+            continue
+
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        parent_id = stack[-1][1] if stack else None
+        node = diag.add_node(title, parent_id=parent_id, note=note)
+        stack.append((indent, node.id))
+
+    return diag
+
+
 # =============================================================================
 # 2. TEXT MEASUREMENT & BIDIRECTIONAL HYBRID TIDY-TREE LAYOUT ENGINE
 # =============================================================================
 
 BRACE_GAP = 5.0
 MIN_BOX_W = 68.0
+NOTE_DIVIDER_HEIGHT = 12.0
+NOTE_DIVIDER_MIN_W = 36.0
 
 
 def format_multiline(text: str) -> str:
     return text.replace("\\n", "\n")
+
+
+def _is_divider_line(line: str) -> bool:
+    s = line.strip()
+    return len(s) >= 3 and set(s) == {"-"}
+
+
+def parse_note_segments(note_text: str) -> List[Tuple[str, str]]:
+    """Split note text into ('text', chunk) and ('divider', '') segments on '---' lines."""
+    normalized = format_multiline(note_text.strip())
+    if not normalized:
+        return []
+    segments: List[Tuple[str, str]] = []
+    buf: List[str] = []
+    for line in normalized.split("\n"):
+        if _is_divider_line(line):
+            if buf:
+                segments.append(("text", "\n".join(buf)))
+                buf = []
+            segments.append(("divider", ""))
+        else:
+            buf.append(line)
+    if buf:
+        segments.append(("text", "\n".join(buf)))
+    return segments
 
 
 def make_pango_layout(
@@ -599,6 +820,30 @@ class LayoutEngine:
         _ox, _oy, w, h = get_tight_extents(layout)
         return (w, h)
 
+    def measure_note(
+        self,
+        note_text: str,
+        font_family: str,
+        font_size: int,
+        line_spacing: float = 4.0,
+    ) -> Tuple[float, float]:
+        segments = parse_note_segments(note_text)
+        if not segments:
+            return (0.0, 0.0)
+        max_w = 0.0
+        total_h = 0.0
+        for kind, content in segments:
+            if kind == "divider":
+                max_w = max(max_w, NOTE_DIVIDER_MIN_W)
+                total_h += NOTE_DIVIDER_HEIGHT
+            else:
+                w, h = self.measure_text(
+                    content, font_family, font_size, bold=False, line_spacing=line_spacing
+                )
+                max_w = max(max_w, w)
+                total_h += h
+        return (max_w, total_h)
+
     def layout(self, diagram: Diagram) -> None:
         s = diagram.settings
         for node in diagram.nodes.values():
@@ -608,8 +853,8 @@ class LayoutEngine:
             node.w = max(MIN_BOX_W, tw + s.box_pad_x * 2.0)
             node.h = max(s.min_box_h, th + s.box_pad_y * 2.0)
             if node.note.strip():
-                nw, nh = self.measure_text(
-                    node.note.strip(), s.font_family, s.note_font_size, bold=False, line_spacing=s.line_spacing
+                nw, nh = self.measure_note(
+                    node.note, s.font_family, s.note_font_size, line_spacing=s.line_spacing
                 )
                 node.note_w = nw
                 node.note_h = nh
@@ -888,6 +1133,8 @@ class DiagramRenderer:
         dark_canvas: bool = False,
         selected_id: Optional[str] = None,
         hover_id: Optional[str] = None,
+        selected_link_id: Optional[str] = None,
+        hover_link_id: Optional[str] = None,
         connect_src_id: Optional[str] = None,
         guides: Optional[List[Tuple[str, float, float, float]]] = None,
         bg_mode: str = "theme",
@@ -923,7 +1170,16 @@ class DiagramRenderer:
         self._draw_all_tree_branches(cr, diagram, fg)
 
         for lk in diagram.links:
-            self._draw_custom_link(cr, diagram, lk, fg, accent, is_dark)
+            self._draw_custom_link(
+                cr,
+                diagram,
+                lk,
+                fg,
+                accent,
+                is_dark,
+                is_selected=(lk.id == selected_link_id),
+                is_hover=(lk.id == hover_link_id),
+            )
 
         for node in diagram.nodes.values():
             self._draw_node(
@@ -1176,28 +1432,16 @@ class DiagramRenderer:
 
         cr.restore()
 
-    def _draw_custom_link(
-        self,
-        cr: cairo.Context,
-        diagram: Diagram,
-        lk: CustomLink,
-        fg: Tuple[float, float, float],
-        accent: Tuple[float, float, float],
-        is_dark: bool,
-    ) -> None:
+    @classmethod
+    def custom_link_geometry(
+        cls, diagram: Diagram, lk: CustomLink
+    ) -> Optional[Tuple[float, float, float, float, float, float]]:
         src = diagram.nodes.get(lk.src_id)
         dst = diagram.nodes.get(lk.dst_id)
         if not src or not dst:
-            return
-        x1, y1 = self._box_edge_point(src, dst.x, dst.y)
-        x2, y2 = self._box_edge_point(dst, src.x, src.y)
-
-        cr.save()
-        cr.set_source_rgb(*accent)
-        cr.set_line_width(max(1.8, diagram.settings.line_width))
-        if lk.dashed:
-            cr.set_dash([6.0, 5.0])
-
+            return None
+        x1, y1 = cls._box_edge_point(src, dst.x, dst.y)
+        x2, y2 = cls._box_edge_point(dst, src.x, src.y)
         mx = (x1 + x2) / 2.0
         my = (y1 + y2) / 2.0
         dx = x2 - x1
@@ -1206,6 +1450,88 @@ class DiagramRenderer:
         nx, ny = -dy / dist, dx / dist
         bend = min(32.0, dist * 0.14)
         cx, cy = mx + nx * bend, my + ny * bend
+        return (x1, y1, cx, cy, x2, y2)
+
+    @staticmethod
+    def custom_link_midpoint(
+        geom: Tuple[float, float, float, float, float, float]
+    ) -> Tuple[float, float]:
+        x1, y1, cx, cy, x2, y2 = geom
+        # Cubic Bezier at t=0.5 with P1=P2=(cx, cy)
+        return ((x1 + 6.0 * cx + x2) / 8.0, (y1 + 6.0 * cy + y2) / 8.0)
+
+    @staticmethod
+    def _point_to_segment_dist(
+        px: float, py: float, ax: float, ay: float, bx: float, by: float
+    ) -> float:
+        dx = bx - ax
+        dy = by - ay
+        len_sq = dx * dx + dy * dy
+        if len_sq < 1e-9:
+            return math.hypot(px - ax, py - ay)
+        t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / len_sq))
+        return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+    @classmethod
+    def hit_test_link(
+        cls, diagram: Diagram, wx: float, wy: float, threshold: float = 9.0
+    ) -> Optional[str]:
+        best_id: Optional[str] = None
+        best_dist = threshold
+        steps = 24
+        for lk in reversed(diagram.links):
+            geom = cls.custom_link_geometry(diagram, lk)
+            if not geom:
+                continue
+            x1, y1, cx, cy, x2, y2 = geom
+            if lk.label.strip():
+                lmx, lmy = cls.custom_link_midpoint(geom)
+                if abs(wx - lmx) <= max(28.0, threshold * 3.0) and abs(wy - lmy) <= max(14.0, threshold * 1.6):
+                    return lk.id
+            prev_x, prev_y = x1, y1
+            for i in range(1, steps + 1):
+                t = i / steps
+                mt = 1.0 - t
+                # B(t) for cubic Bezier with P1 = P2 = (cx, cy)
+                c_mid = 3.0 * mt * t
+                bx = (mt ** 3) * x1 + c_mid * cx + (t ** 3) * x2
+                by = (mt ** 3) * y1 + c_mid * cy + (t ** 3) * y2
+                d = cls._point_to_segment_dist(wx, wy, prev_x, prev_y, bx, by)
+                if d < best_dist:
+                    best_dist = d
+                    best_id = lk.id
+                prev_x, prev_y = bx, by
+        return best_id
+
+    def _draw_custom_link(
+        self,
+        cr: cairo.Context,
+        diagram: Diagram,
+        lk: CustomLink,
+        fg: Tuple[float, float, float],
+        accent: Tuple[float, float, float],
+        is_dark: bool,
+        is_selected: bool = False,
+        is_hover: bool = False,
+    ) -> None:
+        geom = self.custom_link_geometry(diagram, lk)
+        if not geom:
+            return
+        x1, y1, cx, cy, x2, y2 = geom
+        base_lw = max(1.8, diagram.settings.line_width)
+
+        cr.save()
+        if is_selected or is_hover:
+            cr.set_source_rgba(accent[0], accent[1], accent[2], 0.28 if is_selected else 0.14)
+            cr.set_line_width(base_lw + (8.0 if is_selected else 6.0))
+            cr.move_to(x1, y1)
+            cr.curve_to(cx, cy, cx, cy, x2, y2)
+            cr.stroke()
+
+        cr.set_source_rgb(*accent)
+        cr.set_line_width(base_lw + (0.8 if is_selected else 0.0))
+        if lk.dashed:
+            cr.set_dash([6.0, 5.0])
 
         cr.move_to(x1, y1)
         cr.curve_to(cx, cy, cx, cy, x2, y2)
@@ -1213,7 +1539,13 @@ class DiagramRenderer:
 
         cr.set_dash([])
         if lk.arrow:
-            self._draw_arrowhead(cr, cx, cy, x2, y2, size=9.0)
+            self._draw_arrowhead(cr, cx, cy, x2, y2, size=9.5 if is_selected else 9.0)
+
+        if is_selected:
+            cr.set_source_rgb(*accent)
+            for px, py in ((x1, y1), (x2, y2)):
+                cr.arc(px, py, 3.8, 0, math.tau)
+                cr.fill()
 
         if lk.label.strip():
             layout = make_pango_layout(
@@ -1224,11 +1556,17 @@ class DiagramRenderer:
                 line_spacing=diagram.settings.line_spacing,
             )
             ox, oy, tw, th = get_tight_extents(layout)
-            lx = (x1 + 2 * cx + x2) / 4.0 - tw / 2.0
-            ly = (y1 + 2 * cy + y2) / 4.0 - th / 2.0
-            cr.set_source_rgba(*(0.08, 0.10, 0.13, 0.9) if is_dark else (1.0, 1.0, 1.0, 0.92))
+            mid_x, mid_y = self.custom_link_midpoint(geom)
+            lx = mid_x - tw / 2.0
+            ly = mid_y - th / 2.0
+            cr.set_source_rgba(*(0.08, 0.10, 0.13, 0.92) if is_dark else (1.0, 1.0, 1.0, 0.94))
             cr.rectangle(lx - 4, ly - 2, tw + 8, th + 4)
             cr.fill()
+            if is_selected:
+                cr.set_source_rgba(accent[0], accent[1], accent[2], 0.75)
+                cr.set_line_width(1.2)
+                cr.rectangle(lx - 4, ly - 2, tw + 8, th + 4)
+                cr.stroke()
             cr.set_source_rgb(*accent)
             cr.move_to(lx - ox, ly - oy)
             PangoCairo.show_layout(cr, layout)
@@ -1339,9 +1677,27 @@ class DiagramRenderer:
         note_fg: Tuple[float, float, float],
     ) -> None:
         s = diagram.settings
-        note_text = node.note.strip()
-        layout = make_pango_layout(cr, note_text, s.font_family, s.note_font_size, line_spacing=s.line_spacing)
-        ox, oy, tw, th = get_tight_extents(layout)
+        segments = parse_note_segments(node.note)
+        if not segments:
+            return
+
+        rendered_parts = []
+        tw = 0.0
+        th = 0.0
+        for kind, content in segments:
+            if kind == "divider":
+                tw = max(tw, NOTE_DIVIDER_MIN_W)
+                th += NOTE_DIVIDER_HEIGHT
+                rendered_parts.append(("divider", None, 0.0, 0.0, NOTE_DIVIDER_MIN_W, NOTE_DIVIDER_HEIGHT))
+            else:
+                layout = make_pango_layout(
+                    cr, content, s.font_family, s.note_font_size, line_spacing=s.line_spacing
+                )
+                ox, oy, pw, ph = get_tight_extents(layout)
+                tw = max(tw, pw)
+                th += ph
+                rendered_parts.append(("text", layout, ox, oy, pw, ph))
+
         is_up = node.branch_side == "up"
 
         if s.direction == "vertical":
@@ -1355,11 +1711,8 @@ class DiagramRenderer:
                     note_bottom = brace_base - s.brace_height - 2.0
                 else:
                     note_bottom = brace_base - 3.0
-                cr.save()
-                cr.set_source_rgb(*note_fg)
-                cr.move_to(node.x - tw / 2.0 - ox, note_bottom - th - oy)
-                PangoCairo.show_layout(cr, layout)
-                cr.restore()
+                center_x = node.x
+                top_y = note_bottom - th
             else:
                 brace_y = node.y + node.h / 2.0 + 3.0
                 if node.show_brace:
@@ -1370,11 +1723,8 @@ class DiagramRenderer:
                     note_y = brace_y + s.brace_height + 2.0
                 else:
                     note_y = brace_y + 3.0
-                cr.save()
-                cr.set_source_rgb(*note_fg)
-                cr.move_to(node.x - tw / 2.0 - ox, note_y - oy)
-                PangoCairo.show_layout(cr, layout)
-                cr.restore()
+                center_x = node.x
+                top_y = note_y
         else:
             if is_up:
                 brace_x = node.x + node.w / 2.0 + 3.0
@@ -1386,11 +1736,8 @@ class DiagramRenderer:
                     note_x = brace_x + s.brace_height + 4.0
                 else:
                     note_x = brace_x + 5.0
-                cr.save()
-                cr.set_source_rgb(*note_fg)
-                cr.move_to(note_x - ox, node.y - th / 2.0 - oy)
-                PangoCairo.show_layout(cr, layout)
-                cr.restore()
+                center_x = note_x + tw / 2.0
+                top_y = node.y - th / 2.0
             else:
                 brace_x = node.x - node.w / 2.0 - 3.0
                 if node.show_brace:
@@ -1401,11 +1748,27 @@ class DiagramRenderer:
                     note_x = brace_x - s.brace_height - 4.0 - tw
                 else:
                     note_x = brace_x - 5.0 - tw
-                cr.save()
+                center_x = note_x + tw / 2.0
+                top_y = node.y - th / 2.0
+
+        div_w = max(NOTE_DIVIDER_MIN_W, min(tw, max(node.w * 0.78, tw * 0.85)))
+        cur_y = top_y
+        cr.save()
+        for kind, layout, ox, oy, pw, ph in rendered_parts:
+            if kind == "divider":
+                line_y = cur_y + ph / 2.0
+                cr.set_source_rgba(note_fg[0], note_fg[1], note_fg[2], 0.35)
+                cr.set_line_width(1.0)
+                cr.set_dash([])
+                cr.move_to(center_x - div_w / 2.0, line_y)
+                cr.line_to(center_x + div_w / 2.0, line_y)
+                cr.stroke()
+            else:
                 cr.set_source_rgb(*note_fg)
-                cr.move_to(note_x - ox, node.y - th / 2.0 - oy)
+                cr.move_to(center_x - pw / 2.0 - ox, cur_y - oy)
                 PangoCairo.show_layout(cr, layout)
-                cr.restore()
+            cur_y += ph
+        cr.restore()
 
     @staticmethod
     def _draw_horizontal_brace(
@@ -1608,6 +1971,44 @@ class DiagramRenderer:
 # =============================================================================
 # 4. EXPORTER (SVG / PDF / PNG)
 # =============================================================================
+
+def render_diagram_to_svg_bytes(
+    diagram: Diagram,
+    bg_mode: str = "transparent",
+) -> bytes:
+    engine = LayoutEngine()
+    engine.layout(diagram)
+    bx, by, bw, bh = engine.get_bounds(diagram, margin=34.0)
+    renderer = DiagramRenderer()
+    buf = io.BytesIO()
+    surface = cairo.SVGSurface(buf, bw, bh)
+    cr = cairo.Context(surface)
+    cr.translate(-bx, -by)
+    renderer.render(cr, diagram, bg_mode=bg_mode, bounds=(bx, by, bw, bh))
+    surface.finish()
+    return buf.getvalue()
+
+
+def render_diagram_to_png_bytes(
+    diagram: Diagram,
+    bg_mode: str = "white",
+    scale: float = 3.0,
+) -> bytes:
+    engine = LayoutEngine()
+    engine.layout(diagram)
+    bx, by, bw, bh = engine.get_bounds(diagram, margin=34.0)
+    renderer = DiagramRenderer()
+    w_px = max(1, int(math.ceil(bw * scale)))
+    h_px = max(1, int(math.ceil(bh * scale)))
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, w_px, h_px)
+    cr = cairo.Context(surface)
+    cr.scale(scale, scale)
+    cr.translate(-bx, -by)
+    renderer.render(cr, diagram, bg_mode=bg_mode, bounds=(bx, by, bw, bh))
+    buf = io.BytesIO()
+    surface.write_to_png(buf)
+    return buf.getvalue()
+
 
 def export_diagram(
     diagram: Diagram,
@@ -1896,6 +2297,7 @@ ARABIC_KEYVAL_TO_LATIN = {
     "Arabic_ra": "v",
     "Arabic_feh": "t",
     "Arabic_sad": "w",
+    "Arabic_heh": "i",
 }
 
 LINUX_KEYCODE_TO_LATIN = {
@@ -1908,6 +2310,8 @@ LINUX_KEYCODE_TO_LATIN = {
     26: "e",
     38: "a",
     54: "c",
+    55: "v",
+    31: "i",
     19: "0",
     28: "t",
     25: "w",
@@ -1996,10 +2400,14 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
             self.undo_stack: List[dict] = self.tabs[0].undo_stack
             self.redo_stack: List[dict] = self.tabs[0].redo_stack
             self.selected_id: Optional[str] = self.tabs[0].selected_id
+            self.selected_link_id: Optional[str] = self.tabs[0].selected_link_id
 
             self.hover_id: Optional[str] = None
+            self.hover_link_id: Optional[str] = None
             self.connect_mode: bool = False
             self.connect_src_id: Optional[str] = None
+            self.reparent_src_id: Optional[str] = None
+            self._node_clipboard: Optional[dict] = None
             self.dark_canvas: bool = bool(self.user_config.get("dark_canvas", True))
             self._updating_ui: bool = False
 
@@ -2056,6 +2464,10 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
             btn_open.connect("clicked", lambda *_: self._open_file_dialog())
             header.pack_start(btn_open)
 
+            btn_import = Gtk.Button(label="استيراد نص", tooltip_text="استيراد مخطط من نص بمسافات بادئة (Ctrl+I)")
+            btn_import.connect("clicked", lambda *_: self._show_outline_import_dialog())
+            header.pack_start(btn_import)
+
             btn_save = Gtk.Button(icon_name="document-save-symbolic", tooltip_text="حفظ (Ctrl+S)")
             btn_save.connect("clicked", lambda *_: self._save_file(save_as=False))
             header.pack_start(btn_save)
@@ -2096,6 +2508,57 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
             btn_export.add_css_class("suggested-action")
             btn_export.connect("clicked", lambda *_: self._show_export_dialog())
             header.pack_end(btn_export)
+
+            clip_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+            clip_box.add_css_class("linked")
+            btn_copy_png = Gtk.Button(
+                label="نسخ كصورة",
+                tooltip_text="نسخ المخطط إلى الحافظة (SVG متجهي افتراضياً — Ctrl+Shift+C)",
+            )
+            btn_copy_png.connect("clicked", lambda *_: self.copy_diagram_to_clipboard())
+            clip_box.append(btn_copy_png)
+
+            clip_menu_btn = Gtk.MenuButton(tooltip_text="اختيار صيغة وخلفية النسخ إلى الحافظة")
+            clip_pop = Gtk.Popover()
+            clip_pop_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            clip_pop_box.set_margin_top(6)
+            clip_pop_box.set_margin_bottom(6)
+            clip_pop_box.set_margin_start(6)
+            clip_pop_box.set_margin_end(6)
+
+            b_clip_svg_trans = Gtk.Button(label="SVG متجهي — خلفية شفافة (افتراضي)")
+            b_clip_svg_trans.add_css_class("flat")
+            b_clip_svg_trans.connect(
+                "clicked",
+                lambda *_: (clip_pop.popdown(), self.copy_diagram_to_clipboard(bg_mode="transparent", fmt="svg")),
+            )
+            b_clip_svg_white = Gtk.Button(label="SVG متجهي — خلفية بيضاء")
+            b_clip_svg_white.add_css_class("flat")
+            b_clip_svg_white.connect(
+                "clicked",
+                lambda *_: (clip_pop.popdown(), self.copy_diagram_to_clipboard(bg_mode="white", fmt="svg")),
+            )
+            b_clip_png_white = Gtk.Button(label="PNG عالية الدقة (3x) — خلفية بيضاء")
+            b_clip_png_white.add_css_class("flat")
+            b_clip_png_white.connect(
+                "clicked",
+                lambda *_: (clip_pop.popdown(), self.copy_diagram_to_clipboard(bg_mode="white", fmt="png")),
+            )
+            b_clip_png_trans = Gtk.Button(label="PNG عالية الدقة (3x) — خلفية شفافة")
+            b_clip_png_trans.add_css_class("flat")
+            b_clip_png_trans.connect(
+                "clicked",
+                lambda *_: (clip_pop.popdown(), self.copy_diagram_to_clipboard(bg_mode="transparent", fmt="png")),
+            )
+            clip_pop_box.append(b_clip_svg_trans)
+            clip_pop_box.append(b_clip_svg_white)
+            clip_pop_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+            clip_pop_box.append(b_clip_png_white)
+            clip_pop_box.append(b_clip_png_trans)
+            clip_pop.set_child(clip_pop_box)
+            clip_menu_btn.set_popover(clip_pop)
+            clip_box.append(clip_menu_btn)
+            header.pack_end(clip_box)
 
             self.btn_canvas_theme = Gtk.ToggleButton(
                 label="معاينة ورق أبيض", tooltip_text="التبديل بين خلفية داكنة وخلفية ورقة طباعة بيضاء"
@@ -2182,6 +2645,7 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
             self.add_controller(key_ctrl)
 
             self._build_edit_popover()
+            self._build_link_edit_popover()
             self._build_context_popover()
 
             status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -2197,6 +2661,39 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
 
         def _build_inspector(self, box) -> None:
             Gtk = self._Gtk
+
+            # Contextual CustomLink editor (visible when a custom link is selected)
+            self.link_inspector_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            lbl_link = Gtk.Label(label="السهم الحر المحدد", xalign=0.0)
+            lbl_link.add_css_class("section-title")
+            self.link_inspector_box.append(lbl_link)
+
+            self.link_inspector_box.append(Gtk.Label(label="نص السهم (اختياري):", xalign=0.0))
+            self.entry_link_label = Gtk.Entry(placeholder_text="توضيح فوق السهم...")
+            self.entry_link_label.connect("changed", self._on_link_label_changed)
+            self.link_inspector_box.append(self.entry_link_label)
+
+            ldash_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            ldash_row.append(Gtk.Label(label="خط متقطّع:", xalign=0.0, hexpand=True))
+            self.sw_link_dashed = Gtk.Switch()
+            self.sw_link_dashed.connect("notify::active", self._on_link_dashed_toggled)
+            ldash_row.append(self.sw_link_dashed)
+            self.link_inspector_box.append(ldash_row)
+
+            larr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            larr_row.append(Gtk.Label(label="إظهار رأس السهم:", xalign=0.0, hexpand=True))
+            self.sw_link_arrow = Gtk.Switch()
+            self.sw_link_arrow.connect("notify::active", self._on_link_arrow_toggled)
+            larr_row.append(self.sw_link_arrow)
+            self.link_inspector_box.append(larr_row)
+
+            btn_del_link = Gtk.Button(label="حذف هذا السهم (Delete)")
+            btn_del_link.add_css_class("destructive-action")
+            btn_del_link.connect("clicked", lambda *_: self.delete_selected_link())
+            self.link_inspector_box.append(btn_del_link)
+            self.link_inspector_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+            self.link_inspector_box.set_visible(False)
+            box.append(self.link_inspector_box)
 
             lbl_node = Gtk.Label(label="المربع المحدد", xalign=0.0)
             lbl_node.add_css_class("section-title")
@@ -2400,14 +2897,15 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
                 "• Tab: إضافة فرع للأسفل (أو بنفس اتجاه الأب)\n"
                 "• Shift+Tab: إضافة فرع للأعلى ↑\n"
                 "• Shift+Enter: إضافة نظير\n"
-                "• Enter داخل النص: سطر جديد\n"
-                "• Ctrl+Enter في النافذة المنبثقة: حفظ\n"
+                "• Enter داخل النص: سطر جديد (و --- لفاصل أفقي)\n"
+                "• Ctrl+C / Ctrl+V: نسخ ولصق الفرع كاملاً\n"
+                "• Ctrl+Shift+C: نسخ المخطط للحافظة (SVG / PNG)\n"
+                "• Ctrl+I: استيراد مخطط من نص بمسافات بادئة\n"
+                "• النقر على سهم حر: تعديله أو حذفه بـ Delete\n"
+                "• Ctrl+Enter في النوافذ المنبثقة: حفظ\n"
                 "• Ctrl+E: فتح نافذة التصدير (Enter للحفظ)\n"
-                "• Ctrl+T / Ctrl+N: لسان جديد\n"
-                "• Ctrl+W: إغلاق اللسان الحالي\n"
-                "• Ctrl+Tab: التنقل بين الألسنة\n"
-                "• F9: إظهار/إخفاء لوحة الخيارات\n"
-                "• Ctrl+L: إعادة ترتيب الشجرة",
+                "• Ctrl+T / Ctrl+N / Ctrl+W / Ctrl+Tab: الألسنة\n"
+                "• F9: لوحة الخيارات  |  Ctrl+L: محاذاة تلقائية",
                 xalign=0.0,
             )
             hint.add_css_class("hint-label")
@@ -2454,6 +2952,43 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
 
             self.edit_popover.set_child(pbox)
 
+        def _build_link_edit_popover(self) -> None:
+            Gtk = self._Gtk
+            self.link_popover = Gtk.Popover()
+            self.link_popover.set_parent(self.canvas)
+            pbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            pbox.set_margin_top(8)
+            pbox.set_margin_bottom(8)
+            pbox.set_margin_start(10)
+            pbox.set_margin_end(10)
+            pbox.set_size_request(250, -1)
+
+            pbox.append(Gtk.Label(label="نص السهم الحر:", xalign=0.0))
+            self.pop_link_label = Gtk.Entry(placeholder_text="توضيح فوق السهم...")
+            self.pop_link_label.connect("activate", lambda *_: self._apply_link_popover_edit())
+            pbox.append(self.pop_link_label)
+
+            self.pop_link_dashed = Gtk.CheckButton(label="خط متقطّع (Dashed)")
+            pbox.append(self.pop_link_dashed)
+
+            self.pop_link_arrow = Gtk.CheckButton(label="إظهار رأس السهم")
+            pbox.append(self.pop_link_arrow)
+
+            btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            btn_del = Gtk.Button(label="حذف", hexpand=True)
+            btn_del.add_css_class("destructive-action")
+            btn_del.connect(
+                "clicked", lambda *_: (self.link_popover.popdown(), self.delete_selected_link())
+            )
+            btn_ok = Gtk.Button(label="تم (Enter)", hexpand=True)
+            btn_ok.add_css_class("suggested-action")
+            btn_ok.connect("clicked", lambda *_: self._apply_link_popover_edit())
+            btn_row.append(btn_del)
+            btn_row.append(btn_ok)
+            pbox.append(btn_row)
+
+            self.link_popover.set_child(pbox)
+
         def _build_context_popover(self) -> None:
             Gtk = self._Gtk
             self.ctx_popover = Gtk.Popover()
@@ -2465,7 +3000,9 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
             self.ctx_box.set_margin_end(6)
             self.ctx_popover.set_child(self.ctx_box)
 
-        def _open_context_menu(self, sx: float, sy: float, hit_id: Optional[str]) -> None:
+        def _open_context_menu(
+            self, sx: float, sy: float, hit_id: Optional[str], hit_link_id: Optional[str] = None
+        ) -> None:
             Gtk = self._Gtk
             child = self.ctx_box.get_first_child()
             while child is not None:
@@ -2492,21 +3029,41 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
                     flip_lbl = "نقل الفرع للأسفل ↓" if node.branch_side == "up" else "نقل الفرع للأعلى ↑"
                     new_side = "down" if node.branch_side == "up" else "up"
                     add_item(flip_lbl, lambda s=new_side: self._flip_selected_side(s))
+                add_item("نسخ الفرع (Ctrl+C)", self.copy_selected_subtree)
+                if self._node_clipboard is not None:
+                    add_item("لصق الفرع هنا (Ctrl+V)", self.paste_subtree_to_selected)
+                add_item("نقل إلى أب آخر", lambda nid=hit_id: self._start_reparent_mode(nid))
                 if (not node.is_free) and (node.free_pos is not None):
                     add_item("إعادة للمحاذاة التلقائية", self._release_selected_free)
                 add_item(
                     "ربط بسهم مع مربع آخر",
                     lambda: (
+                        setattr(self, "reparent_src_id", None),
                         self.btn_connect.set_active(True),
                         setattr(self, "connect_src_id", hit_id),
                         self.canvas.queue_draw(),
                     ),
                 )
                 add_item("حذف المربع", self.delete_selected, destructive=True)
+            elif hit_link_id and self.diagram.get_link(hit_link_id) is not None:
+                lk = self.diagram.get_link(hit_link_id)
+                add_item("تعديل نص السهم", lambda lid=hit_link_id: self._open_link_edit_popover(lid))
+                add_item(
+                    "تبديل إلى خط متصل" if lk.dashed else "تبديل إلى خط متقطّع",
+                    self._toggle_selected_link_dashed,
+                )
+                add_item(
+                    "إخفاء رأس السهم" if lk.arrow else "إظهار رأس السهم",
+                    self._toggle_selected_link_arrow,
+                )
+                add_item("حذف السهم", self.delete_selected_link, destructive=True)
             else:
                 wx, wy = self.screen_to_world(sx, sy)
                 self._context_world_pos = (wx, wy)
                 add_item("+ إضافة مربع حر هنا", lambda: self.add_free_box(pos=self._context_world_pos))
+                if self._node_clipboard is not None:
+                    add_item("لصق الفرع المنسوخ (Ctrl+V)", self.paste_subtree_to_selected)
+                add_item("استيراد مخطط من نص (Ctrl+I)", self._show_outline_import_dialog)
                 add_item("إعادة محاذاة الشجرة تلقائياً", self.auto_layout_all)
                 add_item("ملاءمة المخطط للشاشة", self.fit_to_view)
 
@@ -2565,6 +3122,8 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
             self.diagram = Diagram.from_dict(self.undo_stack.pop())
             if self.selected_id not in self.diagram.nodes:
                 self.selected_id = self.diagram.root_ids[0] if self.diagram.root_ids else None
+            if self.diagram.get_link(self.selected_link_id) is None:
+                self.selected_link_id = None
             self._relayout_and_redraw()
             self._sync_inspector()
 
@@ -2575,6 +3134,8 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
             self.diagram = Diagram.from_dict(self.redo_stack.pop())
             if self.selected_id not in self.diagram.nodes:
                 self.selected_id = self.diagram.root_ids[0] if self.diagram.root_ids else None
+            if self.diagram.get_link(self.selected_link_id) is None:
+                self.selected_link_id = None
             self._relayout_and_redraw()
             self._sync_inspector()
 
@@ -2604,7 +3165,9 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
                 dark_canvas=self.dark_canvas,
                 selected_id=self.selected_id,
                 hover_id=self.hover_id,
-                connect_src_id=self.connect_src_id,
+                selected_link_id=self.selected_link_id,
+                hover_link_id=self.hover_link_id,
+                connect_src_id=self.connect_src_id or self.reparent_src_id,
                 guides=self._active_guides,
             )
             cr.restore()
@@ -2628,17 +3191,51 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
                 x += step
             cr.fill()
 
+        def _hit_test_link_world(self, wx: float, wy: float) -> Optional[str]:
+            thresh = max(9.0, 9.0 / max(self.zoom, 0.25))
+            return self.renderer.hit_test_link(self.diagram, wx, wy, threshold=thresh)
+
         def _on_canvas_pressed(self, gesture, n_press: int, x: float, y: float) -> None:
             self.canvas.grab_focus()
             btn = gesture.get_current_button()
             wx, wy = self.screen_to_world(x, y)
             hit = self.hit_test(wx, wy)
+            hit_link = None if hit else self._hit_test_link_world(wx, wy)
 
             if btn == 3:
-                self.selected_id = hit
+                if hit:
+                    self.selected_id = hit
+                    self.selected_link_id = None
+                elif hit_link:
+                    self.selected_id = None
+                    self.selected_link_id = hit_link
+                else:
+                    self.selected_id = None
+                    self.selected_link_id = None
                 self._sync_inspector()
                 self.canvas.queue_draw()
-                self._open_context_menu(x, y, hit)
+                self._open_context_menu(x, y, hit, hit_link)
+                return
+
+            if self.reparent_src_id is not None:
+                if hit:
+                    src_id = self.reparent_src_id
+                    if hit == src_id or hit in self.diagram.collect_subtree_ids(src_id):
+                        self._update_status("لا يمكن نقل المربع إلى نفسه أو إلى أحد فروعه (اضغط Esc للإلغاء)")
+                        return
+                    self._push_undo()
+                    if self.diagram.reparent_node(src_id, hit):
+                        self.selected_id = src_id
+                        self.selected_link_id = None
+                        self.reparent_src_id = None
+                        self._relayout_and_redraw()
+                        self._sync_inspector()
+                        self._update_status("تم نقل المربع إلى الأب الجديد")
+                    else:
+                        self.reparent_src_id = None
+                        self.canvas.queue_draw()
+                else:
+                    self._update_status("انقر على مربع آخر ليكون الأب الجديد (أو اضغط Esc للإلغاء)")
                 return
 
             if self.connect_mode:
@@ -2648,20 +3245,33 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
                         self._update_status("اختر المربع الهدف لإتمام الربط بسهم (أو اضغط Esc للإلغاء)")
                     elif hit != self.connect_src_id:
                         self._push_undo()
-                        self.diagram.add_link(self.connect_src_id, hit)
+                        lk = self.diagram.add_link(self.connect_src_id, hit)
                         self.connect_src_id = None
                         self.btn_connect.set_active(False)
+                        if lk is not None:
+                            self.selected_id = None
+                            self.selected_link_id = lk.id
                         self._sync_inspector()
-                        self._update_status("تم إنشاء سهم ربط بين المربعين")
+                        self._update_status("تم إنشاء سهم ربط — انقر عليه لتعديل نصه أو نمطه")
                     self.canvas.queue_draw()
                 return
 
-            self.selected_id = hit
+            if hit:
+                self.selected_id = hit
+                self.selected_link_id = None
+            elif hit_link:
+                self.selected_id = None
+                self.selected_link_id = hit_link
+            else:
+                self.selected_id = None
+                self.selected_link_id = None
             self._sync_inspector()
             self.canvas.queue_draw()
 
             if n_press == 2 and hit:
                 self._open_edit_popover(hit)
+            elif n_press == 2 and hit_link:
+                self._open_link_edit_popover(hit_link)
 
         def _on_drag_begin(self, gesture, start_x: float, start_y: float) -> None:
             btn = gesture.get_current_button()
@@ -2717,8 +3327,10 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
         def _on_motion(self, _ctrl, x: float, y: float) -> None:
             wx, wy = self.screen_to_world(x, y)
             hit = self.hit_test(wx, wy)
-            if hit != self.hover_id:
+            hit_link = None if hit else self._hit_test_link_world(wx, wy)
+            if hit != self.hover_id or hit_link != self.hover_link_id:
                 self.hover_id = hit
+                self.hover_link_id = hit_link
                 self.canvas.queue_draw()
 
         def _on_scroll(self, ctrl, _dx: float, dy: float) -> bool:
@@ -2769,6 +3381,12 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
             if ctrl_down and (name in ("Page_Up", "ISO_Left_Tab") or (name == "Tab" and shift_down)):
                 self._switch_tab_relative(-1)
                 return True
+            if ctrl_down and shift_down and letter == "c":
+                self.copy_diagram_to_clipboard()
+                return True
+            if ctrl_down and letter == "i":
+                self._show_outline_import_dialog()
+                return True
             if ctrl_down and letter == "e":
                 self._show_export_dialog()
                 return True
@@ -2786,8 +3404,16 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
 
             if name == "Escape":
                 self.connect_src_id = None
+                self.reparent_src_id = None
                 self.btn_connect.set_active(False)
+                self._update_status("تم الإلغاء")
                 self.canvas.queue_draw()
+                return True
+            if ctrl_down and letter == "c" and not shift_down:
+                self.copy_selected_subtree()
+                return True
+            if ctrl_down and letter == "v" and not shift_down:
+                self.paste_subtree_to_selected()
                 return True
             if ctrl_down and letter == "z":
                 if shift_down:
@@ -2810,12 +3436,20 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
             if (name == "Return" and shift_down) or name == "Insert":
                 self.add_sibling_to_selected()
                 return True
-            if name in ("Return", "F2") and self.selected_id:
-                self._open_edit_popover(self.selected_id)
-                return True
-            if name in ("Delete", "BackSpace") and self.selected_id:
-                self.delete_selected()
-                return True
+            if name in ("Return", "F2"):
+                if self.selected_link_id and self.diagram.get_link(self.selected_link_id):
+                    self._open_link_edit_popover(self.selected_link_id)
+                    return True
+                if self.selected_id:
+                    self._open_edit_popover(self.selected_id)
+                    return True
+            if name in ("Delete", "BackSpace"):
+                if self.selected_link_id and self.diagram.get_link(self.selected_link_id):
+                    self.delete_selected_link()
+                    return True
+                if self.selected_id:
+                    self.delete_selected()
+                    return True
             if letter == "c" and not ctrl_down:
                 self.btn_connect.set_active(not self.btn_connect.get_active())
                 return True
@@ -2861,6 +3495,192 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
                 self._sync_inspector()
             self.edit_popover.popdown()
             self.canvas.grab_focus()
+
+        def _open_link_edit_popover(self, link_id: str) -> None:
+            lk = self.diagram.get_link(link_id)
+            if not lk:
+                return
+            geom = self.renderer.custom_link_geometry(self.diagram, lk)
+            if not geom:
+                return
+            mid_x, mid_y = self.renderer.custom_link_midpoint(geom)
+            sx, sy = self.world_to_screen(mid_x, mid_y)
+            rect = self._Gdk.Rectangle()
+            rect.x = int(sx)
+            rect.y = int(sy)
+            rect.width = 1
+            rect.height = 1
+            self.selected_id = None
+            self.selected_link_id = lk.id
+            self._sync_inspector()
+            self.link_popover.set_pointing_to(rect)
+            self.pop_link_label.set_text(lk.label)
+            self.pop_link_dashed.set_active(lk.dashed)
+            self.pop_link_arrow.set_active(lk.arrow)
+            self.link_popover.popup()
+            self.pop_link_label.grab_focus()
+            self.pop_link_label.select_region(0, -1)
+
+        def _apply_link_popover_edit(self) -> None:
+            lk = self.diagram.get_link(self.selected_link_id)
+            if lk is not None:
+                self._push_undo()
+                lk.label = self.pop_link_label.get_text()
+                lk.dashed = self.pop_link_dashed.get_active()
+                lk.arrow = self.pop_link_arrow.get_active()
+                self._sync_inspector()
+                self.canvas.queue_draw()
+                self._update_status("تم تحديث خصائص السهم الحر")
+            self.link_popover.popdown()
+            self.canvas.grab_focus()
+
+        def delete_selected_link(self) -> None:
+            if not self.selected_link_id or self.diagram.get_link(self.selected_link_id) is None:
+                return
+            self._push_undo()
+            self.diagram.delete_link(self.selected_link_id)
+            self.selected_link_id = None
+            self._sync_inspector()
+            self.canvas.queue_draw()
+            self._update_status("تم حذف السهم الحر")
+
+        def _toggle_selected_link_dashed(self) -> None:
+            lk = self.diagram.get_link(self.selected_link_id)
+            if lk is None:
+                return
+            self._push_undo()
+            lk.dashed = not lk.dashed
+            self._sync_inspector()
+            self.canvas.queue_draw()
+
+        def _toggle_selected_link_arrow(self) -> None:
+            lk = self.diagram.get_link(self.selected_link_id)
+            if lk is None:
+                return
+            self._push_undo()
+            lk.arrow = not lk.arrow
+            self._sync_inspector()
+            self.canvas.queue_draw()
+
+        def _on_link_label_changed(self, entry) -> None:
+            if self._updating_ui:
+                return
+            lk = self.diagram.get_link(self.selected_link_id)
+            if lk is None:
+                return
+            lk.label = entry.get_text()
+            self._mark_dirty()
+            self.canvas.queue_draw()
+
+        def _on_link_dashed_toggled(self, sw, _pspec) -> None:
+            if self._updating_ui:
+                return
+            lk = self.diagram.get_link(self.selected_link_id)
+            if lk is None:
+                return
+            self._push_undo()
+            lk.dashed = sw.get_active()
+            self.canvas.queue_draw()
+
+        def _on_link_arrow_toggled(self, sw, _pspec) -> None:
+            if self._updating_ui:
+                return
+            lk = self.diagram.get_link(self.selected_link_id)
+            if lk is None:
+                return
+            self._push_undo()
+            lk.arrow = sw.get_active()
+            self.canvas.queue_draw()
+
+        def copy_selected_subtree(self) -> None:
+            if not self.selected_id or self.selected_id not in self.diagram.nodes:
+                self._update_status("حدّد مربعاً أولاً لنسخه مع شجرته الفرعية")
+                return
+            payload = self.diagram.serialize_subtree(self.selected_id)
+            if payload is None:
+                return
+            self._node_clipboard = payload
+            title = self.diagram.nodes[self.selected_id].title.splitlines()[0] if self.diagram.nodes[self.selected_id].title else "مربع"
+            count = len(payload["nodes"])
+            self._update_status(f"تم نسخ «{title}» ({count} عنصر) — استخدم Ctrl+V للصق")
+
+        def paste_subtree_to_selected(self) -> None:
+            if not self._node_clipboard:
+                self._update_status("لا يوجد فرع منسوخ في الحافظة الداخلية")
+                return
+            self._push_undo()
+            target_parent = self.selected_id if (self.selected_id in self.diagram.nodes) else None
+            pasted = self.diagram.paste_subtree(self._node_clipboard, target_parent_id=target_parent)
+            if pasted is None:
+                return
+            self.selected_id = pasted.id
+            self.selected_link_id = None
+            self._relayout_and_redraw()
+            self._sync_inspector()
+            self._update_status(f"تم لصق «{pasted.title.splitlines()[0] if pasted.title else 'مربع'}» مع فروعه")
+
+        def _start_reparent_mode(self, nid: str) -> None:
+            if nid not in self.diagram.nodes:
+                return
+            self.connect_src_id = None
+            if self.btn_connect.get_active():
+                self.btn_connect.set_active(False)
+            self.reparent_src_id = nid
+            title = self.diagram.nodes[nid].title.splitlines()[0] if self.diagram.nodes[nid].title else "المربع"
+            self._update_status(f"وضع النقل: انقر على المربع الأب الجديد لنقل «{title}» إليه (أو Esc للإلغاء)")
+            self.canvas.queue_draw()
+
+        def copy_diagram_to_clipboard(
+            self, bg_mode: Optional[str] = None, fmt: Optional[str] = None
+        ) -> None:
+            Gdk = self._Gdk
+            GLib = self._GLib
+            resolved_fmt = fmt if fmt is not None else str(self.user_config.get("clipboard_format", "svg"))
+            if resolved_fmt not in ("svg", "png"):
+                resolved_fmt = "svg"
+            default_bg = "transparent" if resolved_fmt == "svg" else "white"
+            bg = bg_mode if bg_mode is not None else str(self.user_config.get("clipboard_bg", default_bg))
+            if bg not in ("white", "transparent"):
+                bg = default_bg
+
+            if bg_mode is not None or fmt is not None:
+                self.user_config["clipboard_format"] = resolved_fmt
+                self.user_config["clipboard_bg"] = bg
+                save_user_config(self.user_config)
+
+            try:
+                display = Gdk.Display.get_default()
+                if display is None:
+                    self._update_status("تعذّر الوصول إلى حافظة النظام")
+                    return
+                clipboard = display.get_clipboard()
+                bg_ar = "خلفية شفافة" if bg == "transparent" else "خلفية بيضاء"
+
+                if resolved_fmt == "svg":
+                    svg_bytes = render_diagram_to_svg_bytes(self.diagram, bg_mode=bg)
+                    svg_gbytes = GLib.Bytes.new(svg_bytes)
+                    svg_provider = Gdk.ContentProvider.new_for_bytes("image/svg+xml", svg_gbytes)
+                    # Include PNG as automatic fallback for apps that only accept raster clipboard images
+                    if hasattr(Gdk.ContentProvider, "new_union"):
+                        png_bytes = render_diagram_to_png_bytes(self.diagram, bg_mode=bg, scale=3.0)
+                        png_provider = Gdk.ContentProvider.new_for_bytes("image/png", GLib.Bytes.new(png_bytes))
+                        provider = Gdk.ContentProvider.new_union([svg_provider, png_provider])
+                    else:
+                        provider = svg_provider
+                    clipboard.set_content(provider)
+                    self._update_status(f"تم نسخ المخطط كـ SVG متجهي إلى الحافظة ({bg_ar})")
+                else:
+                    png_bytes = render_diagram_to_png_bytes(self.diagram, bg_mode=bg, scale=3.0)
+                    gbytes = GLib.Bytes.new(png_bytes)
+                    if hasattr(Gdk.ContentProvider, "new_for_bytes"):
+                        provider = Gdk.ContentProvider.new_for_bytes("image/png", gbytes)
+                        clipboard.set_content(provider)
+                    else:
+                        tex = Gdk.Texture.new_from_bytes(gbytes)
+                        clipboard.set_texture(tex)
+                    self._update_status(f"تم نسخ المخطط كصورة PNG عالية الدقة إلى الحافظة ({bg_ar})")
+            except Exception as exc:
+                self._update_status(f"تعذّر نسخ الصورة إلى الحافظة: {exc}")
 
         def add_child_to_selected(self, side: Optional[str] = None) -> None:
             self._push_undo()
@@ -2978,6 +3798,14 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
             self._updating_ui = True
             s = self.diagram.settings
             node = self.diagram.nodes.get(self.selected_id) if self.selected_id else None
+            link = self.diagram.get_link(self.selected_link_id)
+
+            self.link_inspector_box.set_visible(link is not None)
+            if link is not None:
+                if self.entry_link_label.get_text() != link.label:
+                    self.entry_link_label.set_text(link.label)
+                self.sw_link_dashed.set_active(link.dashed)
+                self.sw_link_arrow.set_active(link.arrow)
 
             self.tv_title.set_sensitive(node is not None)
             self.tv_note.set_sensitive(node is not None)
@@ -3236,6 +4064,7 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
             tab.undo_stack = self.undo_stack
             tab.redo_stack = self.redo_stack
             tab.selected_id = self.selected_id
+            tab.selected_link_id = self.selected_link_id
             tab.zoom = self.zoom
             tab.pan_x = self.pan_x
             tab.pan_y = self.pan_y
@@ -3247,6 +4076,7 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
             self.undo_stack = tab.undo_stack
             self.redo_stack = tab.redo_stack
             self.selected_id = tab.selected_id
+            self.selected_link_id = tab.selected_link_id
             self.zoom = tab.zoom
             self.pan_x = tab.pan_x
             self.pan_y = tab.pan_y
@@ -3309,6 +4139,7 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
                 self.active_tab_idx = idx
             self._load_active_tab_state()
             self.connect_src_id = None
+            self.reparent_src_id = None
             if hasattr(self, "btn_connect") and self.btn_connect.get_active():
                 self.btn_connect.set_active(False)
             self.layout_engine.layout(self.diagram)
@@ -3557,6 +4388,130 @@ def run_gui(initial_files: Optional[List[str]] = None) -> int:
                     self._pending_close_tab_id = None
             except Exception:
                 self._pending_close_tab_id = None
+
+        def _show_outline_import_dialog(self) -> None:
+            Gtk = self._Gtk
+            Gdk = self._Gdk
+            win = Gtk.Window(transient_for=self, modal=True, title="استيراد مخطط من نص")
+            win.set_default_size(520, 460)
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            vbox.set_margin_top(14)
+            vbox.set_margin_bottom(14)
+            vbox.set_margin_start(16)
+            vbox.set_margin_end(16)
+            win.set_child(vbox)
+
+            hint = Gtk.Label(
+                label="أدخل قائمة عربية بمسافات بادئة (مسافتان أو Tab لكل مستوى).\n"
+                "أضف الأمثلة بعد الرمز | ، ويمكنك استخدام \\n لسطر جديد و --- لفاصل أفقي.",
+                xalign=0.0,
+            )
+            hint.set_wrap(True)
+            hint.add_css_class("hint-label")
+            vbox.append(hint)
+
+            sample_outline = (
+                "أقسام الكلمة\n"
+                "  اسم | زيد، شجرة\n---\nكتاب\n"
+                "    معرب\n"
+                "    مبني | هذا، الذي\n"
+                "  فعل\n"
+                "    ماضٍ | كَتَبَ\n"
+                "    مضارع | يَكتُبُ\n"
+                "    أمر | اُكتُبْ\n"
+                "  حرف | في، على، لم"
+            ).replace("\n---\n", "\\n---\\n")
+
+            preview_lbl = Gtk.Label(xalign=0.0)
+            preview_lbl.add_css_class("hint-label")
+
+            def update_preview(*_):
+                raw = get_textview_text(tv_outline)
+                d_prev = parse_outline_text(raw)
+                n_cnt = len(d_prev.nodes)
+                r_cnt = len(d_prev.root_ids)
+                if n_cnt == 0:
+                    preview_lbl.set_text("أدخل سطراً واحداً على الأقل لبناء المخطط")
+                else:
+                    preview_lbl.set_text(f"سيتم إنشاء {n_cnt} عنصر ({r_cnt} جذر)")
+
+            scroll, tv_outline = make_multiline_box(Gtk, min_height=250, on_changed=update_preview)
+            scroll.set_vexpand(True)
+            scroll.set_max_content_height(600)
+            set_textview_text(tv_outline, sample_outline)
+            vbox.append(scroll)
+
+            dir_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            dir_row.append(Gtk.Label(label="اتجاه المخطط:", xalign=0.0, hexpand=True))
+            dd_imp_dir = Gtk.DropDown.new_from_strings(["عمودي (فوق وتحت)", "أفقي (يمين ويسار)"])
+            dd_imp_dir.set_selected(0 if self.diagram.settings.direction == "vertical" else 1)
+            dir_row.append(dd_imp_dir)
+            vbox.append(dir_row)
+
+            vbox.append(preview_lbl)
+            update_preview()
+
+            btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            btn_cancel = Gtk.Button(label="إلغاء (Esc)", hexpand=True)
+            btn_cancel.connect("clicked", lambda *_: win.close())
+            btn_create = Gtk.Button(label="إنشاء في لسان جديد (Ctrl+Enter)", hexpand=True)
+            btn_create.add_css_class("suggested-action")
+
+            def on_create(*_):
+                raw = get_textview_text(tv_outline)
+                settings = get_default_diagram_settings(self.user_config)
+                settings.direction = "vertical" if dd_imp_dir.get_selected() == 0 else "horizontal"
+                diag = parse_outline_text(raw, settings=settings)
+                if not diag.nodes:
+                    preview_lbl.set_text("النص فارغ — أدخل عنصراً واحداً على الأقل")
+                    return
+                win.close()
+                self._save_active_tab_state()
+                first_title = (
+                    diag.nodes[diag.root_ids[0]].title.splitlines()[0].strip()
+                    if diag.root_ids and diag.root_ids[0] in diag.nodes
+                    else ""
+                )
+                self._tab_counter += 1
+                tab_title = (first_title[:24] + "…") if len(first_title) > 24 else (first_title or f"مستورد {self._tab_counter}")
+                new_tab = DiagramTab(
+                    id=uuid.uuid4().hex[:8],
+                    diagram=diag,
+                    current_file=None,
+                    selected_id=diag.root_ids[0] if diag.root_ids else None,
+                    dirty=True,
+                    is_starter=False,
+                    view_initialized=False,
+                    title_fallback=tab_title,
+                )
+                self.tabs.append(new_tab)
+                self._switch_to_tab(len(self.tabs) - 1)
+                self._update_status(f"تم استيراد المخطط في لسان جديد ({len(diag.nodes)} عنصر)")
+
+            btn_create.connect("clicked", on_create)
+            btn_row.append(btn_cancel)
+            btn_row.append(btn_create)
+            vbox.append(btn_row)
+
+            key_ctrl = Gtk.EventControllerKey()
+            key_ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+
+            def on_imp_key(_c, keyval, _code, state):
+                kname = Gdk.keyval_name(keyval) or ""
+                if kname == "Escape":
+                    win.close()
+                    return True
+                if (state & Gdk.ModifierType.CONTROL_MASK) and kname in ("Return", "KP_Enter"):
+                    on_create()
+                    return True
+                return False
+
+            key_ctrl.connect("key-pressed", on_imp_key)
+            win.add_controller(key_ctrl)
+            win.present()
+            tv_outline.grab_focus()
+            buf = tv_outline.get_buffer()
+            buf.select_range(buf.get_start_iter(), buf.get_end_iter())
 
         def _show_export_dialog(self) -> None:
             Gtk = self._Gtk
